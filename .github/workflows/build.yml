@@ -131,6 +131,21 @@ jobs:
           echo "Found IPA: $IPA"
           test -n "$IPA"
 
+      - name: Verify PiP symbols in packaged IPA (nm/otool/strings)
+        run: |
+          set -euxo pipefail
+          bash build/verify_pip_symbols.sh "${{ steps.ipa.outputs.ipa_path }}" verify_out
+          echo "===== RESULT.txt ====="
+          cat verify_out/RESULT.txt
+
+      - name: Upload PiP verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-symbol-verification
+          path: verify_out
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:

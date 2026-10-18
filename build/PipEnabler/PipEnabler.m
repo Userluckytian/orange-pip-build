@@ -68,9 +68,12 @@ static CMSampleBufferRef PipEnablerCreateSampleBuffer(CVPixelBufferRef pixelBuff
         return NULL;
     }
     CMSampleTimingInfo timing;
-    timing.duration             = kCMTimeInvalid;
+    // AVSampleBufferDisplayLayer 需要【有效的 PTS + duration】才能按时间轴推进渲染；
+    // 若 duration 为 kCMTimeInvalid，部分 iOS 版本会判定样本不可渲染，
+    // 导致 isPictureInPicturePossible 永远为 NO、PiP 无法起播。
+    timing.duration              = CMTimeMake(1, 30);   // 按 30fps 估算
     timing.presentationTimeStamp = CMTIME_IS_VALID(pts) ? pts : CMTimeMake(0, 1);
-    timing.decodeTimeStamp      = kCMTimeInvalid;
+    timing.decodeTimeStamp       = kCMTimeInvalid;
 
     CMSampleBufferRef sampleBuffer = NULL;
     status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault,
@@ -79,9 +82,15 @@ static CMSampleBufferRef PipEnablerCreateSampleBuffer(CVPixelBufferRef pixelBuff
                                                       &timing,
                                                       &sampleBuffer);
     CFRelease(formatDesc);
-    if (status != noErr) {
+    if (status != noErr || sampleBuffer == NULL) {
         return NULL;
     }
+    // 帧镜像场景下必须"立即显示"：不依赖 controlTimebase 的节拍，
+    // 否则在时间轴尚未推进时 display layer 会保留空画面，PiP 无法进入 possible。
+    CMSetAttachment(sampleBuffer,
+                    kCMSampleBufferAttachmentKey_DisplayImmediately,
+                    kCFBooleanTrue,
+                    kCMAttachmentMode_ShouldPropagate);
     return sampleBuffer;
 }
 
@@ -364,18 +373,24 @@ API_AVAILABLE(ios(15.0))
         }
         self.mirrorLayer = layer;
 
-        // 挂到一个透明小宿主视图上（部分 iOS 版本要求该 layer 处于 window 层级内）
+        // ★ PiP 硬前提：AVSampleBufferDisplayLayer 必须真正处于 keyWindow 的
+        //   视图层级内且【可见】（hidden=NO、alpha>0、位于屏幕内、bounds 非零）。
+        //   之前用 hidden=YES + 负坐标(-2,-2) + 2x2 的宿主视图，会被系统视为
+        //   不可渲染，isPictureInPicturePossible 恒为 NO —— 这是画中画无法真正
+        //   触发的关键缺陷，现已修正为"屏内 2x2、非隐藏、底层"的宿主视图。
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self.mirrorHostView == nil) {
-                UIView *host = [[UIView alloc] initWithFrame:CGRectMake(-kPipMirrorHostViewSize,
-                                                                        -kPipMirrorHostViewSize,
+                UIView *host = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
                                                                         kPipMirrorHostViewSize,
                                                                         kPipMirrorHostViewSize)];
                 host.backgroundColor = UIColor.clearColor;
+                host.opaque = NO;
+                host.alpha = 1.0;          // 必须 >0：alpha=0/hidden 会挂起图层渲染
+                host.hidden = NO;          // 必须非隐藏
+                host.clipsToBounds = NO;
                 host.userInteractionEnabled = NO;
-                host.hidden = YES; // 不参与展示，仅承载 layer
-                [host.layer addSublayer:self.mirrorLayer];
                 self.mirrorLayer.frame = host.bounds;
+                [host.layer addSublayer:self.mirrorLayer];
                 UIWindow *keyWindow = nil;
                 for (UIWindow *w in UIApplication.sharedApplication.windows) {
                     if (w.isKeyWindow) { keyWindow = w; break; }
@@ -383,7 +398,11 @@ API_AVAILABLE(ios(15.0))
                 if (keyWindow == nil) {
                     keyWindow = UIApplication.sharedApplication.windows.firstObject;
                 }
-                [keyWindow addSubview:host];
+                if (keyWindow == nil) {
+                    return;                // 无可挂载窗口，等下一次 refreshDetection 重试
+                }
+                [keyWindow addSubview:host];       // 置于屏内(0,0) 2x2，肉眼不可见但参与渲染
+                [keyWindow bringSubviewToFront:host];
                 self.mirrorHostView = host;
             }
         });
@@ -422,9 +441,43 @@ API_AVAILABLE(ios(15.0))
     if ([controller respondsToSelector:@selector(setCanStartPictureInPictureAutomaticallyFromInline:)]) {
         controller.canStartPictureInPictureAutomaticallyFromInline = YES;
     }
+    // ★ 硬前提 2：只有 controller.isPictureInPicturePossible == YES 时，
+    //   startPictureInPicture 才会真正生效。图层刚建立时该值通常还是 NO，
+    //   直接调用必然失败；因此 KVO 监听它，一旦变 YES 立即起播。
+    @try {
+        [controller addObserver:self
+                     forKeyPath:@"pictureInPicturePossible"
+                        options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionInitial
+                        context:NULL];
+    } @catch (NSException *e) {
+        // 重复注册等异常忽略
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey, id> *)change
+                       context:(void *)context {
+    if ([keyPath isEqualToString:@"pictureInPicturePossible"]) {
+        if (self.enabled && self.pipController != nil &&
+            self.pipController.isPictureInPicturePossible &&
+            !self.pipController.isPictureInPictureActive) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.pipController startPictureInPicture];
+            });
+        }
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
 }
 
 - (void)teardownPipeline {
+    if (self.pipController != nil) {
+        @try {
+            [self.pipController removeObserver:self forKeyPath:@"pictureInPicturePossible"];
+        } @catch (NSException *e) {
+        }
+    }
     self.pipController = nil;
     self.playbackDelegate = nil;
     if (self.mirrorLayer) {
@@ -519,12 +572,22 @@ API_AVAILABLE(ios(15.0))
     if ([layer respondsToSelector:@selector(enqueueSampleBuffer:)]) {
         [layer enqueueSampleBuffer:sampleBuffer];
     }
-    if (layer.timebase != NULL) {
+    if (layer.controlTimebase != NULL) {
         CMTimebaseSetRate(layer.controlTimebase, 1.0);
     }
     if (!self.pipActive && self.pipController != nil) {
-        // 帧已开始流入，尝试自动拉起 PiP
+        // 帧已开始流入，尝试自动拉起 PiP；若此刻仍不可用，KVO 会在
+        // pictureInPicturePossible 变 YES 后补一次起播。
         self.pipActive = YES;
+        if (!self.pipController.isPictureInPictureActive) {
+            if ([NSThread isMainThread]) {
+                [self.pipController startPictureInPicture];
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self.pipController startPictureInPicture];
+                });
+            }
+        }
     }
 }
 
