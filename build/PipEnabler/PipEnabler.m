@@ -151,6 +151,56 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
     return nil;
 }
 
+#pragma mark - 采样缓冲播放代理（iOS 15+ 的 sampleBufferDisplayLayer 路径必需）
+
+// 说明：AVPictureInPictureControllerContentSource 没有单参数
+// initWithSampleBufferDisplayLayer:，必须一并提供 playbackDelegate；
+// 该代理由系统在 PiP 窗口里回调，实现全部 @required 方法即可。
+API_AVAILABLE(ios(15.0))
+@interface PipSampleBufferPlaybackDelegate : NSObject <AVPictureInPictureSampleBufferPlaybackDelegate>
+@property (nonatomic, assign) BOOL playing;
+@end
+
+@implementation PipSampleBufferPlaybackDelegate
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _playing = YES;
+    }
+    return self;
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+                        setPlaying:(BOOL)playing {
+    self.playing = playing;
+}
+
+- (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController *)pictureInPictureController {
+    return !self.playing;
+}
+
+- (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)pictureInPictureController {
+    // 帧镜像无固定时长，返回一个以当前时间起、足够长的区间。
+    CMTime start = CMTimeMake((int64_t)(CFAbsoluteTimeGetCurrent() * 1000.0), 1000);
+    return CMTimeRangeMake(start, CMTimeMake(3600, 1));
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+              didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
+    // 无需处理：渲染尺寸由系统按 layer 内容自动适配。
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+                     skipByInterval:(CMTime)skipInterval
+                  completionHandler:(void (^)(void))completionHandler {
+    if (completionHandler) {
+        completionHandler();
+    }
+}
+
+@end
+
 #pragma mark - PiP 管理器
 
 @interface PipEnablerManager : NSObject
@@ -161,6 +211,8 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
 @property (nonatomic, strong) AVSampleBufferDisplayLayer   *mirrorLayer;
 @property (nonatomic, strong) UIView                       *mirrorHostView;
 @property (nonatomic, weak)   AVPlayerLayer                *detectedPlayerLayer;
+// 必须强引用：contentSource 的 playbackDelegate 为 weak。
+@property (nonatomic, strong) id                            playbackDelegate;
 @property (nonatomic, assign) CMTime                        lastPresentationTime;
 
 + (instancetype)shared;
@@ -345,9 +397,15 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
     }
 
     if (@available(iOS 15.0, *)) {
-        if ([AVPictureInPictureControllerContentSource instancesRespondToSelector:@selector(initWithSampleBufferDisplayLayer:)]) {
+        SEL sbInit = @selector(initWithSampleBufferDisplayLayer:playbackDelegate:);
+        if ([AVPictureInPictureControllerContentSource instancesRespondToSelector:sbInit]) {
+            if (self.playbackDelegate == nil) {
+                self.playbackDelegate = [[PipSampleBufferPlaybackDelegate alloc] init];
+            }
             AVPictureInPictureControllerContentSource *src =
-                [[AVPictureInPictureControllerContentSource alloc] initWithSampleBufferDisplayLayer:self.mirrorLayer];
+                [[AVPictureInPictureControllerContentSource alloc]
+                    initWithSampleBufferDisplayLayer:self.mirrorLayer
+                                    playbackDelegate:self.playbackDelegate];
             AVPictureInPictureController *controller =
                 [[AVPictureInPictureController alloc] initWithContentSource:src];
             [self configureAutoStartForController:controller];
@@ -368,6 +426,7 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
 
 - (void)teardownPipeline {
     self.pipController = nil;
+    self.playbackDelegate = nil;
     if (self.mirrorLayer) {
         [self.mirrorLayer flushAndRemoveImage];
         [self.mirrorLayer removeFromSuperlayer];
