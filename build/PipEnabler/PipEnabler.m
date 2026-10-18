@@ -45,6 +45,16 @@
 //       iOS 16.6.1 上对【实际视频】可进入 pictureInPicturePossible 并起播。
 //       同时保留原有 enqueueSampleBuffer: swizzle（对走 sample buffer 的
 //       播放器仍然有效）作为第三重兜底。
+//    3b) 【#373 新增：机理不同的兜底抓帧路径】#370 自认的残余风险是"两个钩子都是纯 ObjC
+//       运行时 swizzle"。本轮再补一条【C 函数级 inline hook】（用 App 包内自带
+//       libsubstrate.dylib 的 MSHookFunction），目标 CoreVideo 的
+//       CVOpenGLESTextureCacheCreateTextureFromImage —— FFmpeg(VideoToolbox 硬解) 把解码出的
+//       CVPixelBuffer 上传成 GL 纹理时必经此处，其 sourceImage 参数即真实帧。
+//       同时新增三类 ObjC 读点：(c) 返回 CVPixelBuffer 的 getter（^{__CVBuffer=}16@0:8，
+//       典型 -[FOKContentNativeController latestPixelBuffer]）；(d) 返回对象、入参一个
+//       CVPixelBuffer 的工厂方法（@24@0:8^{__CVBuffer=}16）；(e) 输入输出均为 CVPixelBuffer
+//       的变换方法（^{__CVBuffer=}24@0:8^{__CVBuffer=}16）。这些 selector / 返回类型均不在
+//       #370 两个钩子的覆盖范围内。
 //    4) 全部使用公开 API，不含任何私有符号；所有新 API 调用均以
 //       respondsToSelector / @available 兜底，保证 iOS 15.0 ~ 16.6.1 可编译可运行。
 //
@@ -68,6 +78,9 @@
 #import <CoreVideo/CoreVideo.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+// 仅用于运行时 dlopen/dlsym 取得包内自带 libsubstrate.dylib 的 MSHookFunction
+// （C 函数级 inline hook 需要它；本 dylib 不静态链接 substrate，避免额外依赖）。
+#import <dlfcn.h>
 
 #pragma mark - 常量与全局
 
@@ -98,8 +111,40 @@ static NSMutableDictionary<NSString *, NSValue *> *gOriginalCopyPixelBufferIMPs 
 static NSMutableSet<NSString *> *gSwizzledCVBufferConsumerClasses = nil;
 static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferConsumerIMPs = nil;
 
+/// 【本轮新增 #373】(c) FOKContentNativeController / FOKContentPixelBufferViewProtocol
+/// 这类"读出点"：返回 CVPixelBuffer 的 getter，类型编码 ^{__CVBuffer=}16@0:8。
+/// 它不在现有 -copyPixelBuffer 钩子的覆盖范围内（selector/返回类型都不同）。
+static NSMutableSet<NSString *> *gSwizzledCVBufferGetterClasses = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferGetterIMPs = nil;
+
+/// 【本轮新增 #373】(d) 返回对象、入参恰为一个 CVPixelBuffer 的工厂/初始化方法
+/// （^@24@0:8^{__CVBuffer=}16），入参即解码后的帧。
+static NSMutableSet<NSString *> *gSwizzledCVBufferFactoryClasses = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferFactoryIMPs = nil;
+
+/// 【本轮新增 #373】(e) 返回 CVPixelBuffer、入参恰为一个 CVPixelBuffer 的变换方法
+/// （^{__CVBuffer=}24@0:8^{__CVBuffer=}16）。
+static NSMutableSet<NSString *> *gSwizzledCVBufferTransformClasses = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferTransformIMPs = nil;
+
 /// 线程局部重入保护：同一帧经多级实现（子类 → 父类）转发时只喂一次。
 static __thread int gPipFeedDepth = 0;
+
+/// 把一帧 CVPixelBuffer 交给镜像管线（带线程局部重入保护，防止多级转发重复喂帧）。
+#define PIP_ENABLER_FEED_PIXELBUFFER(pb)                                          \
+    do {                                                                          \
+        CVPixelBufferRef _pipPB = (CVPixelBufferRef)(pb);                         \
+        if (_pipPB != NULL && gPipFeedDepth == 0) {                               \
+            gPipFeedDepth++;                                                      \
+            @try {                                                                \
+                if ([[PipEnablerManager shared] isEnabled]) {                     \
+                    PipEnablerFeedPixelBuffer(_pipPB);                            \
+                }                                                                 \
+            } @finally {                                                          \
+                gPipFeedDepth--;                                                  \
+            }                                                                     \
+        }                                                                         \
+    } while (0)
 
 #pragma mark - C 工具函数
 
@@ -735,6 +780,43 @@ static void PipEnablerSwizzledCVBufferConsumer(id self, SEL _cmd, CVBufferRef bu
     }
 }
 
+/// (c) 返回 CVPixelBuffer 的 getter（^{__CVBuffer=}16@0:8）。
+/// 典型：FOKContentNativeController 的 -latestPixelBuffer（"读出点"，与 -copyPixelBuffer
+/// 的 selector / 返回类型都不同，故原有两个钩子均未覆盖）。
+static CVPixelBufferRef PipEnablerSwizzledCVBufferGetter(id self, SEL _cmd) {
+    IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCVBufferGetterIMPs);
+    if (original == NULL) {
+        return NULL;
+    }
+    CVPixelBufferRef pb = ((CVPixelBufferRef (*)(id, SEL))original)(self, _cmd);
+    PIP_ENABLER_FEED_PIXELBUFFER(pb);
+    return pb;
+}
+
+/// (d) 返回对象、入参恰为一个 CVPixelBuffer 的工厂/初始化方法（@24@0:8^{__CVBuffer=}16）。
+/// 入参即解码后的帧；先喂帧再调用原实现。
+static id PipEnablerSwizzledCVBufferFactory(id self, SEL _cmd, CVPixelBufferRef buffer) {
+    IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCVBufferFactoryIMPs);
+    PIP_ENABLER_FEED_PIXELBUFFER(buffer);
+    if (original != NULL) {
+        return ((id (*)(id, SEL, CVPixelBufferRef))original)(self, _cmd, buffer);
+    }
+    return nil;
+}
+
+/// (e) 返回 CVPixelBuffer、入参恰为一个 CVPixelBuffer 的变换方法
+/// （^{__CVBuffer=}24@0:8^{__CVBuffer=}16）；入参与返回值都可能是真实帧。
+static CVPixelBufferRef PipEnablerSwizzledCVBufferTransform(id self, SEL _cmd, CVPixelBufferRef buffer) {
+    IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCVBufferTransformIMPs);
+    PIP_ENABLER_FEED_PIXELBUFFER(buffer);
+    if (original != NULL) {
+        CVPixelBufferRef out = ((CVPixelBufferRef (*)(id, SEL, CVPixelBufferRef))original)(self, _cmd, buffer);
+        PIP_ENABLER_FEED_PIXELBUFFER(out);
+        return out;
+    }
+    return buffer;
+}
+
 /// 遍历全部已注册类，安装真实路径抓帧 swizzle。
 /// 说明：ObjC 类在镜像加载阶段（构造函数之前）即已注册，故此处一次遍历即可覆盖
 ///      Runner 主二进制 / App.framework / Flutter.framework 中定义的所有相关类。
@@ -745,6 +827,12 @@ static void PipEnablerInstallFrameCaptureHooks(void) {
         gOriginalCopyPixelBufferIMPs = [NSMutableDictionary dictionary];
         gSwizzledCVBufferConsumerClasses = [NSMutableSet set];
         gOriginalCVBufferConsumerIMPs = [NSMutableDictionary dictionary];
+        gSwizzledCVBufferGetterClasses = [NSMutableSet set];
+        gOriginalCVBufferGetterIMPs = [NSMutableDictionary dictionary];
+        gSwizzledCVBufferFactoryClasses = [NSMutableSet set];
+        gOriginalCVBufferFactoryIMPs = [NSMutableDictionary dictionary];
+        gSwizzledCVBufferTransformClasses = [NSMutableSet set];
+        gOriginalCVBufferTransformIMPs = [NSMutableDictionary dictionary];
 
         int classCount = objc_getClassList(NULL, 0);
         if (classCount <= 0) {
@@ -759,6 +847,9 @@ static void PipEnablerInstallFrameCaptureHooks(void) {
 
         int pipHooked = 0;
         int cbufferHooked = 0;
+        int getterHooked = 0;
+        int factoryHooked = 0;
+        int transformHooked = 0;
         for (int i = 0; i < classCount; i++) {
             Class cls = classes[i];
             NSString *clsName = NSStringFromClass(cls);
@@ -793,13 +884,141 @@ static void PipEnablerInstallFrameCaptureHooks(void) {
                         cbufferHooked++;
                         PIP_LOG(@"(b) hooked -[%@ %@]", clsName, NSStringFromSelector(sel));
                     }
+                } else if (strcmp(enc, "^{__CVBuffer=}16@0:8") == 0 ||
+                           strcmp(enc, "^{__CVPixelBuffer=}16@0:8") == 0) {
+                    // (c) 返回 CVPixelBuffer 的 getter 读点（如 -latestPixelBuffer）
+                    if (PipEnablerInstallSwizzle(cls, clsName, methods[j],
+                                                 (IMP)PipEnablerSwizzledCVBufferGetter,
+                                                 gSwizzledCVBufferGetterClasses,
+                                                 gOriginalCVBufferGetterIMPs)) {
+                        getterHooked++;
+                        PIP_LOG(@"(c) hooked getter -[%@ %@] type=^{__CVBuffer=}16@0:8",
+                                clsName, NSStringFromSelector(sel));
+                    }
+                } else if (strcmp(enc, "@24@0:8^{__CVBuffer=}16") == 0 ||
+                           strcmp(enc, "@24@0:8^{__CVPixelBuffer=}16") == 0) {
+                    // (d) 返回对象、入参一个 CVPixelBuffer 的工厂方法
+                    if (PipEnablerInstallSwizzle(cls, clsName, methods[j],
+                                                 (IMP)PipEnablerSwizzledCVBufferFactory,
+                                                 gSwizzledCVBufferFactoryClasses,
+                                                 gOriginalCVBufferFactoryIMPs)) {
+                        factoryHooked++;
+                        PIP_LOG(@"(d) hooked factory -[%@ %@] type=@24@0:8^{__CVBuffer=}16",
+                                clsName, NSStringFromSelector(sel));
+                    }
+                } else if (strcmp(enc, "^{__CVBuffer=}24@0:8^{__CVBuffer=}16") == 0 ||
+                           strcmp(enc, "^{__CVPixelBuffer=}24@0:8^{__CVPixelBuffer=}16") == 0) {
+                    // (e) 返回 CVPixelBuffer、入参一个 CVPixelBuffer 的变换方法
+                    if (PipEnablerInstallSwizzle(cls, clsName, methods[j],
+                                                 (IMP)PipEnablerSwizzledCVBufferTransform,
+                                                 gSwizzledCVBufferTransformClasses,
+                                                 gOriginalCVBufferTransformIMPs)) {
+                        transformHooked++;
+                        PIP_LOG(@"(e) hooked transform -[%@ %@] type=^{__CVBuffer=}24@0:8^{__CVBuffer=}16",
+                                clsName, NSStringFromSelector(sel));
+                    }
                 }
             }
             free(methods);
         }
         free(classes);
-        PIP_LOG(@"frame capture hooks installed: copyPixelBuffer=%d, cvBufferConsumer=%d",
-                pipHooked, cbufferHooked);
+        PIP_LOG(@"frame capture hooks installed: copyPixelBuffer=%d, cvBufferConsumer=%d, getter=%d, factory=%d, transform=%d",
+                pipHooked, cbufferHooked, getterHooked, factoryHooked, transformHooked);
+    });
+}
+
+#pragma mark - C 函数级抓帧（#373：机理不同于上述 ObjC swizzle 的兜底路径）
+
+// 说明：
+//   上述 (a)~(e) 都是 Objective-C 运行时 swizzle。本段补一条【机理不同】的抓帧路径 ——
+//   直接用 libsubstrate 的 MSHookFunction 对 C 函数做 inline hook。
+//
+//   抓帧点选择：FFmpeg(VideoToolbox 硬解) 解码出的 CVPixelBuffer，在 fok_media_core 里
+//   经 OpenGL ES2 上传为纹理时，会调用 CoreVideo 的
+//       CVReturn CVOpenGLESTextureCacheCreateTextureFromImage(
+//           CFAllocatorRef allocator, CVOpenGLESTextureCacheRef textureCache,
+//           CVImageBufferRef sourceImage, CFDictionaryRef textureAttributes,
+//           GLenum target, GLint internalFormat, GLsizei width, GLsizei height,
+//           GLenum format, GLenum type, size_t planeIndex,
+//           GLfloat planeWidth, GLfloat planeHeight, CVOpenGLESTextureRef *textureOut);
+//   其第 3 个参数 sourceImage 就是【解码后的真实 CVPixelBuffer】—— 这正是
+//   "CVOpenGLESTextureCache 回读" 抓帧点（见二进制内 _CVOpenGLESTextureCacheCreateTextureFromImage
+//   的导入与 "Error at CVOpenGLESTextureCacheCreate %d" / "[GLES2] after %s() glError" 等痕迹）。
+//   planeIndex==0 时抓一次即可（NV12 的第 1 个 plane 调用即完整帧）。
+
+/// MSHookFunction 原型（现代 libsubstrate/CydiaSubstrate：void MSHookFunction(void *symbol, void *hook, void **old)）
+typedef void (*PipMSHookFunctionFn)(void *symbol, void *hook, void **old);
+static PipMSHookFunctionFn gPipMSHookFunction = NULL;
+
+/// CVOpenGLESTextureCacheCreateTextureFromImage 的函数指针（原实现 / 钩子）
+typedef CVReturn (*PipCVTextureFromImageFn)(CFAllocatorRef allocator, CFTypeRef textureCache,
+                                            CVImageBufferRef sourceImage, CFDictionaryRef textureAttributes,
+                                            uint32_t target, int32_t internalFormat, int32_t width, int32_t height,
+                                            uint32_t format, uint32_t type, size_t planeIndex,
+                                            float planeWidth, float planeHeight, CFTypeRef *textureOut);
+static PipCVTextureFromImageFn gPipOrigCVTextureFromImage = NULL;
+
+static CVReturn PipEnablerHookedCVTextureFromImage(CFAllocatorRef allocator, CFTypeRef textureCache,
+                                                   CVImageBufferRef sourceImage, CFDictionaryRef textureAttributes,
+                                                   uint32_t target, int32_t internalFormat, int32_t width, int32_t height,
+                                                   uint32_t format, uint32_t type, size_t planeIndex,
+                                                   float planeWidth, float planeHeight, CFTypeRef *textureOut) {
+    if (planeIndex == 0 && sourceImage != NULL) {
+        // 该 C 函数不是 Objective-C 方法，不能用 gPipFeedDepth 的 @try/@finally 语义，
+        // 但重入保护同样有效（喂帧过程内部若再次调用本函数会因 depth>0 直接跳过）。
+        PIP_ENABLER_FEED_PIXELBUFFER((CVPixelBufferRef)sourceImage);
+    }
+    if (gPipOrigCVTextureFromImage != NULL) {
+        return gPipOrigCVTextureFromImage(allocator, textureCache, sourceImage, textureAttributes,
+                                          target, internalFormat, width, height, format, type, planeIndex,
+                                          planeWidth, planeHeight, textureOut);
+    }
+    return -6661; // kCVReturnError(≈-6660) 邻域；仅当钩子安装后原指针异常时才走到这里
+}
+
+/// 运行时载入包内 libsubstrate.dylib 并取得 MSHookFunction，然后对目标 C 函数安装 inline hook。
+/// 若 substrate 或目标符号不可用，则安全跳过（不影响 ObjC 抓帧路径），并打日志说明。
+static void PipEnablerInstallCVTextureHook(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // 1) 取 MSHookFunction：优先复用 App 已加载的 substrate（KAlert.dylib 使用 MSHookMessageEx，
+        //    Runner 的 LC_LOAD_DYLIB 也含 @executable_path/Frameworks/libsubstrate.dylib）。
+        void *handle = dlopen("libsubstrate.dylib", RTLD_NOW | RTLD_NOLOAD);
+        if (handle == NULL) {
+            handle = dlopen("libsubstrate.dylib", RTLD_NOW);
+        }
+        if (handle == NULL) {
+            NSString *bundlePath = [NSBundle mainBundle].bundlePath;
+            if (bundlePath.length > 0) {
+                NSString *p = [bundlePath stringByAppendingPathComponent:@"Frameworks/libsubstrate.dylib"];
+                handle = dlopen(p.fileSystemRepresentation, RTLD_NOW);
+            }
+        }
+        if (handle != NULL) {
+            gPipMSHookFunction = (PipMSHookFunctionFn)dlsym(handle, "MSHookFunction");
+        }
+        if (gPipMSHookFunction == NULL) {
+            gPipMSHookFunction = (PipMSHookFunctionFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        }
+        if (gPipMSHookFunction == NULL) {
+            PIP_LOG(@"[cv-hook] MSHookFunction unavailable -> skip C-function hook (CVOpenGLESTextureCacheCreateTextureFromImage)");
+            return;
+        }
+
+        // 2) 定位 CoreVideo 的 CVOpenGLESTextureCacheCreateTextureFromImage
+        void *sym = dlsym(RTLD_DEFAULT, "CVOpenGLESTextureCacheCreateTextureFromImage");
+        if (sym == NULL) {
+            sym = dlsym(RTLD_DEFAULT, "_CVOpenGLESTextureCacheCreateTextureFromImage");
+        }
+        if (sym == NULL) {
+            PIP_LOG(@"[cv-hook] CVOpenGLESTextureCacheCreateTextureFromImage not found -> skip");
+            return;
+        }
+
+        // 3) 安装 inline hook（原实现经 trampoline 保存到 gPipOrigCVTextureFromImage）
+        gPipMSHookFunction(sym, (void *)PipEnablerHookedCVTextureFromImage, (void **)&gPipOrigCVTextureFromImage);
+        PIP_LOG(@"[cv-hook] C-function hook installed: CVOpenGLESTextureCacheCreateTextureFromImage=%p orig=%p",
+                sym, gPipOrigCVTextureFromImage);
     });
 }
 
@@ -869,8 +1088,10 @@ static void PipEnablerInitialize(void) {
     @autoreleasepool {
         // 第一重：sample buffer 播放器兜底
         PipEnablerInstallSwizzles();
-        // 第二/三重：真实解码/渲染路径抓帧（Flutter 外部纹理 + 原生 CVBuffer 消费）
+        // 第二重：真实解码/渲染路径抓帧（ObjC swizzle：Flutter 外部纹理 + CVBuffer 消费/getter/工厂/变换）
         PipEnablerInstallFrameCaptureHooks();
+        // 第三重（机理不同）：C 函数级 inline hook —— CVOpenGLESTextureCacheCreateTextureFromImage
+        PipEnablerInstallCVTextureHook();
 
         __block PipEnablerManager *manager = [PipEnablerManager shared];
         void (^boot)(void) = ^{

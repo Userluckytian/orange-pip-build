@@ -77,6 +77,8 @@ for tok in \
   "_CMVideoFormatDescriptionCreateForImageBuffer" \
   "_CMSampleBufferGetSampleAttachmentsArray" \
   "_CMTimebaseCreateWithSourceClock" \
+  "_dlopen" \
+  "_dlsym" \
   "_objc_msgSend" ; do
   if grep -qF "$tok" "$OUT/nm_u.txt"; then pass "外部引用存在: $tok"; else fail "外部引用缺失: $tok"; MISS=1; fi
 done
@@ -137,19 +139,36 @@ done
 #   (b) 返回 void、仅一个 CVBuffer 参数的原生消费型方法
 say ""
 say "---- [9] 真实路径抓帧逻辑 (copyPixelBuffer / CVBuffer consumer) ----"
-strings -a "$DYLIB" | grep -E 'copyPixelBuffer|CVBuffer|frame capture hooks installed|\[PipEnabler\]' | sort -u | tee "$OUT/strings_framecap.txt" | tee -a "$RESULT" || true
+strings -a "$DYLIB" | grep -E 'copyPixelBuffer|CVBuffer|CVOpenGLESTexture|MSHookFunction|frame capture hooks installed|\[PipEnabler\]' | sort -u | tee "$OUT/strings_framecap.txt" | tee -a "$RESULT" || true
 for tok in "copyPixelBuffer" "v24@0:8^{__CVBuffer=}16" "frame capture hooks installed"; do
   if grep -qF "$tok" "$OUT/strings_framecap.txt"; then pass "抓帧标记存在: $tok"; else fail "抓帧标记缺失: $tok"; MISS=1; fi
 done
 say "[9b] 抓帧相关符号（含局部符号）:"
-nm "$DYLIB" 2>/dev/null | grep -E 'PipEnabler(InstallFrameCaptureHooks|SwizzledCopyPixelBuffer|SwizzledCVBufferConsumer|FeedPixelBuffer)' | tee "$OUT/nm_framecap.txt" | tee -a "$RESULT" || true
+nm "$DYLIB" 2>/dev/null | grep -E 'PipEnabler(InstallFrameCaptureHooks|InstallCVTextureHook|SwizzledCopyPixelBuffer|SwizzledCVBufferConsumer|SwizzledCVBufferGetter|SwizzledCVBufferFactory|SwizzledCVBufferTransform|HookedCVTextureFromImage|FeedPixelBuffer)' | tee "$OUT/nm_framecap.txt" | tee -a "$RESULT" || true
 if [ -s "$OUT/nm_framecap.txt" ]; then
   pass "抓帧函数符号已生成"
 else
   say "（注：静态函数符号可能被 ld 剥离，此项不作为硬性判据；以字符串标记为准）"
 fi
 say "[9c] 反汇编中构造函数调用帧抓取安装点:"
-grep -nE 'PipEnablerInstallFrameCaptureHooks|PipEnablerInstallSwizzles' "$OUT/otool_tv.txt" | tee -a "$RESULT" || true
+grep -nE 'PipEnablerInstallFrameCaptureHooks|PipEnablerInstallSwizzles|PipEnablerInstallCVTextureHook' "$OUT/otool_tv.txt" | tee -a "$RESULT" || true
+
+# ---- 10) #373 新增：机理不同的抓帧路径（C 函数级 hook + CVBuffer 读点） ----
+#   · C 函数级 inline hook：CVOpenGLESTextureCacheCreateTextureFromImage（经 libsubstrate MSHookFunction）
+#   · ObjC 读点：(c) 返回 CVPixelBuffer 的 getter / (d) 工厂 / (e) 变换方法
+say ""
+say "---- [10] #373 C 函数级抓帧 + CVBuffer 读点 ----"
+for tok in "^{__CVBuffer=}16@0:8" "@24@0:8^{__CVBuffer=}16" "^{__CVBuffer=}24@0:8^{__CVBuffer=}16" \
+           "CVOpenGLESTextureCacheCreateTextureFromImage" "MSHookFunction" ; do
+  if grep -qF "$tok" "$OUT/strings_framecap.txt"; then pass "新增抓帧标记存在: $tok"; else fail "新增抓帧标记缺失: $tok"; MISS=1; fi
+done
+say "[10b] 构造函数反汇编片段（应含 PipEnablerInstallCVTextureHook）:"
+grep -A60 '^_PipEnablerInitialize:' "$OUT/otool_tv.txt" | tee "$OUT/ctor_disasm_373.txt" | tee -a "$RESULT" || true
+if grep -q '_PipEnablerInstallCVTextureHook' "$OUT/ctor_disasm_373.txt"; then pass "constructor 调用 PipEnablerInstallCVTextureHook"; else fail "constructor 未调用 PipEnablerInstallCVTextureHook"; MISS=1; fi
+say "[10c] dlopen/dlsym 外部引用（C 函数级 hook 依赖）:"
+grep -E '_dlopen$|_dlsym$' "$OUT/nm_u.txt" | tee "$OUT/nm_dl.txt" | tee -a "$RESULT" || true
+if grep -qE '_dlopen$' "$OUT/nm_dl.txt" && grep -qE '_dlsym$' "$OUT/nm_dl.txt"; then pass "dlopen/dlsym 外部引用存在"; else fail "dlopen/dlsym 外部引用缺失"; MISS=1; fi
+
 
 # ---- 8) 汇总 ----
 say ""
