@@ -106,6 +106,8 @@ jobs:
             -framework AVFoundation \
             -framework AVKit \
             -framework UIKit \
+            -framework CoreMedia \
+            -framework CoreVideo \
             build/PipEnabler/PipEnabler.m \
             -o PipEnabler.dylib
           file PipEnabler.dylib
