@@ -1,0 +1,138 @@
+name: Build Orange Video PiP IPA
+
+# 只在 GitHub Actions runner 内编译/注入/打包，本机不安装任何 iOS 工具链。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build patched IPA with Picture-in-Picture
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Show toolchain versions
+        run: |
+          set -euxo pipefail
+          sw_vers || true
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+          clang --version || true
+
+      - name: Obtain decoded payload (Payload/Runner.app)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          if [ -d "Payload/Runner.app" ]; then
+            echo "Payload/Runner.app already present in checkout."
+          elif [ -f "payload.zip" ]; then
+            echo "Extracting payload.zip ..."
+            unzip -q -o payload.zip -d .
+          elif [ -f "payload.tar.gz" ]; then
+            echo "Extracting payload.tar.gz ..."
+            tar -xzf payload.tar.gz
+          elif ls payload.zip.part.* >/dev/null 2>&1; then
+            echo "Reassembling split payload chunks ..."
+            cat $(ls -1 payload.zip.part.* | sort) > payload.zip
+            unzip -q -o payload.zip -d .
+          else
+            echo "Fetching payload from GitHub Release asset ..."
+            mkdir -p _payload_dl
+            gh release download payload --repo "${GITHUB_REPOSITORY}" --dir _payload_dl --clobber \
+              --pattern "*.zip" --pattern "*.tar.gz" --pattern "*.ipa" || true
+            for f in _payload_dl/*; do
+              [ -e "$f" ] || continue
+              case "$f" in
+                *.zip) unzip -q -o "$f" -d . ;;
+                *.tar.gz) tar -xzf "$f" ;;
+                *.ipa) unzip -q -o "$f" -d . ;;
+              esac
+            done
+          fi
+          test -d "Payload/Runner.app" || { echo "ERROR: Payload/Runner.app not found"; exit 1; }
+          du -sh Payload/Runner.app
+
+      - name: Install ldid
+        run: |
+          set -euxo pipefail
+          if command -v ldid >/dev/null 2>&1; then
+            echo "ldid already available."
+          else
+            brew install ldid || brew install --HEAD ldid || {
+              echo "brew failed, fetching prebuilt ldid ..."
+              curl -L -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64
+              chmod +x /tmp/ldid
+              sudo mv /tmp/ldid /usr/local/bin/ldid || mv /tmp/ldid ./ldid
+            }
+          fi
+          (ldid -v || /usr/local/bin/ldid -v || ./ldid -v) || true
+
+      - name: Patch Info.plist (enable PiP / background modes)
+        run: |
+          set -euxo pipefail
+          python3 build/patch_plist.py Payload/Runner.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :UIRequiresFullScreen" Payload/Runner.app/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" Payload/Runner.app/Info.plist || true
+
+      - name: Compile PipEnabler.dylib
+        run: |
+          set -euxo pipefail
+          SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -dynamiclib \
+            -isysroot "$SDKROOT" \
+            -install_name @executable_path/Frameworks/PipEnabler.dylib \
+            -framework Foundation \
+            -framework AVFoundation \
+            -framework AVKit \
+            -framework UIKit \
+            build/PipEnabler/PipEnabler.m \
+            -o PipEnabler.dylib
+          file PipEnabler.dylib
+          otool -L PipEnabler.dylib || true
+
+      - name: Inject dylib and repack IPA
+        run: |
+          set -euxo pipefail
+          bash build/inject_and_pack.sh Payload/Runner.app PipEnabler.dylib
+          ls -la *.ipa || true
+
+      - name: Locate built IPA
+        id: ipa
+        run: |
+          set -euxo pipefail
+          IPA="$(ls -1t *.ipa 2>/dev/null | head -n1 || true)"
+          if [ -z "$IPA" ]; then
+            IPA="$(find . -maxdepth 4 -name '*.ipa' -not -path './_payload_dl/*' | head -n1 || true)"
+          fi
+          echo "ipa_path=$IPA" >> "$GITHUB_OUTPUT"
+          echo "Found IPA: $IPA"
+          test -n "$IPA"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orange-video-pip-ipa
+          path: ${{ steps.ipa.outputs.ipa_path }}
+          if-no-files-found: error
+          retention-days: 30
