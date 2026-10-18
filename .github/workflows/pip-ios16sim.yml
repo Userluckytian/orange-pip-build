@@ -74,36 +74,32 @@ jobs:
           echo "===== installed Xcode bundles ====="
           ls -1 /Applications 2>/dev/null | grep -i '^Xcode' || true
 
-          try_version () {
-            local XC="$1"; local V="$2"
-            echo "----- try Xcode=[$XC] buildVersion=$V -----"
-            if [ -n "$XC" ]; then
-              sudo xcode-select -s "/Applications/${XC}/Contents/Developer" || true
-            fi
-            xcodebuild -version || true
-            to 1500 xcodebuild -downloadPlatform iOS -buildVersion "$V"
-            echo "xcodebuild rc=$? (buildVersion=$V)"
-            xcrun simctl list runtimes | grep -E 'iOS 16\.' || true
-          }
+          echo "===== [A] default Xcode (15.4): -buildVersion 支持探测 ====="
+          xcodebuild -version || true
+          # Xcode 15.4 无 -buildVersion（invalid option）；Xcode 16.x 支持
+          to 60 xcodebuild -downloadPlatform iOS -buildVersion 999 2>&1 | grep -i -E 'invalid option|is not available|Finding content' || true
 
-          echo "===== [A] current Xcode: -downloadPlatform iOS -buildVersion <V> ====="
-          for V in 16.6 16.6.1 16.4 16.2 16.1 16.0; do
-            have_any16 && { echo "already have an iOS 16 runtime"; break; }
-            try_version "" "$V"
+          echo "===== [B] 用安装了 Xcode_16.x 的 runner 逐个版本下载 iOS 16.x 运行时 ====="
+          # 目标 iOS 16.6.1：优先 16.6，Apple 已下架则退到最接近的 16.x（实测 16.4 可用）
+          for XC in $(ls -1 /Applications 2>/dev/null | grep -E '^Xcode_16' | sort -r); do
+            have_any16 && break
+            sudo xcode-select -s "/Applications/${XC}/Contents/Developer" || continue
+            echo "--- probing ${XC} ---"
+            xcodebuild -version || true
+            if to 60 xcodebuild -downloadPlatform iOS -buildVersion 999 2>&1 | grep -q "invalid option"; then
+              echo "${XC}: does NOT support -buildVersion"; continue
+            fi
+            echo "${XC}: supports -buildVersion"
+            for V in 16.6.1 16.6 16.5.1 16.5 16.4.1 16.4 16.3 16.2 16.1 16.0; do
+              have_any16 && break
+              echo "----- ${XC} buildVersion=$V -----"
+              to 1800 xcodebuild -downloadPlatform iOS -buildVersion "$V"
+              echo "xcodebuild rc=$? (buildVersion=$V)"
+              xcrun simctl list runtimes | grep -E 'iOS 16\.' || true
+            done
           done
 
-          echo "===== [B] other installed Xcode 16.x: same flag ====="
-          if ! have_any16; then
-            for XC in $(ls -1 /Applications 2>/dev/null | grep -E '^Xcode_16' | sort -r); do
-              have_any16 && break
-              xcodebuild -help 2>&1 | grep -i -A2 'buildVersion' || true
-              try_version "$XC" "16.6"
-              have_any16 && break
-              try_version "$XC" "16.4"
-            done
-          fi
-
-          echo "===== [C] exportPath variant (dmg only) ====="
+          echo "===== [C] 若仍无 iOS 16.x：exportPath 变体（仅取 dmg） ====="
           if ! have_any16; then
             to 900 xcodebuild -downloadPlatform iOS -exportPath /tmp/rt166 -buildVersion 16.6
             echo "export rc=$?"
