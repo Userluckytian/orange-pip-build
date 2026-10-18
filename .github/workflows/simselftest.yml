@@ -1,0 +1,207 @@
+name: PiP Simulator Runtime Self-Test
+#
+# 仅在 GitHub Actions 的 macOS runner 内用 iOS 模拟器【真实运行】最小宿主 App，
+# 本机不安装/不运行任何 Xcode / iOS / 签名工具链。
+#
+# 目的（fact #372/#376 的唯一未闭环缺口）：无真机、hook 是否真命中、镜像层是否真能收帧
+# 全靠静态 nm/otool/strings 推断。本 workflow 在模拟器里 dlopen 与真机同源代码编译出的
+# PipEnabler.dylib，实测：
+#   - __attribute__((constructor)) 是否真的执行（不崩溃）；
+#   - PipEnablerInstallSwizzles / PipEnablerInstallFrameCaptureHooks 是否真的改写了 IMP；
+#   - CVPixelBuffer → PipEnablerFeedPixelBuffer → 镜像 AVSampleBufferDisplayLayer 是否跑通；
+#   - AVPictureInPictureController 的支持/possible 取值与 startPictureInPicture 调用结果。
+# 并对【修复前 vs 修复后】两个 dylib 做对照：修复前首帧喂入即无限递归崩溃（运行期缺陷）。
+#
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pip-simselftest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  simselftest:
+    name: iOS Simulator runtime self-test (dlopen PipEnabler.dylib)
+    runs-on: macos-13
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Show toolchain and available simulator runtimes
+        run: |
+          set -x
+          sw_vers || true
+          uname -m
+          xcodebuild -version || true
+          xcode-select -p || true
+          xcrun simctl list runtimes || true
+          xcrun simctl list devices available | head -60 || true
+
+      - name: Build PipEnabler.dylib for iOS Simulator (fixed + unfixed)
+        run: |
+          set -euxo pipefail
+          ARCH="$(uname -m)"
+          SIMSDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          echo "ARCH=$ARCH SIMSDK=$SIMSDK"
+          mkdir -p simout
+
+          build_dylib () {
+            src="$1"; out="$2"
+            xcrun --sdk iphonesimulator clang \
+              -arch "$ARCH" \
+              -mios-simulator-version-min=15.0 \
+              -fobjc-arc -dynamiclib \
+              -isysroot "$SIMSDK" \
+              -install_name @rpath/PipEnabler.dylib \
+              -framework Foundation -framework AVFoundation -framework AVKit \
+              -framework UIKit -framework CoreMedia -framework CoreVideo \
+              "$src" -o "$out"
+            file "$out"
+            otool -L "$out" | head -20 || true
+          }
+
+          # 修复后（当前 HEAD）
+          build_dylib build/PipEnabler/PipEnabler.m simout/PipEnabler_fixed.dylib
+          # 修复前（回归基准：随仓库提交的 #373 源码快照），用于对照复现运行期崩溃
+          cp -f build/simselftest/PipEnabler_pre377.m simout/PipEnabler_unfixed.m
+          build_dylib simout/PipEnabler_unfixed.m simout/PipEnabler_unfixed.dylib
+
+          # 差异确认：仅应差在 gPipFeedSampleDepth 重入保护上
+          (diff -u simout/PipEnabler_unfixed.m build/PipEnabler/PipEnabler.m > simout/dylib_diff.txt || true)
+          echo "===== source diff (unfixed -> fixed) ====="
+          cat simout/dylib_diff.txt
+
+          nm -gU simout/PipEnabler_fixed.dylib | grep -i PipEnabler || true
+
+      - name: Build test host binary (iOS Simulator)
+        run: |
+          set -euxo pipefail
+          ARCH="$(uname -m)"
+          SIMSDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          xcrun --sdk iphonesimulator clang \
+            -arch "$ARCH" \
+            -mios-simulator-version-min=15.0 \
+            -fobjc-arc \
+            -isysroot "$SIMSDK" \
+            -framework UIKit -framework Foundation -framework AVFoundation -framework AVKit \
+            -framework CoreVideo -framework CoreMedia -framework CoreGraphics \
+            build/simselftest/TestHost.m -o simout/TestHost
+          file simout/TestHost
+
+      - name: Assemble .app bundles (unfixed / fixed)
+        run: |
+          set -euxo pipefail
+          make_app () {
+            appName="$1"; dylib="$2"; bid="$3"
+            APP="simout/${appName}.app"
+            mkdir -p "$APP"
+            cp -f simout/TestHost "${APP}/TestHost"
+            cp -f build/simselftest/Info.plist "${APP}/Info.plist"
+            cp -f "$dylib" "${APP}/PipEnabler.dylib"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${bid}" "${APP}/Info.plist"
+            chmod +x "${APP}/TestHost"
+            codesign --force --sign - --timestamp=none "${APP}/PipEnabler.dylib" || true
+            codesign --force --sign - --timestamp=none "$APP" || true
+            echo "--- $APP ---"; ls -la "$APP"
+          }
+          make_app TestHostUnfixed simout/PipEnabler_unfixed.dylib com.artex.pipselftest.unfixed
+          make_app TestHostFixed   simout/PipEnabler_fixed.dylib   com.artex.pipselftest.fixed
+
+      - name: Pick / create iOS simulator device and boot it
+        id: sim
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' > simout/pick_runtime.txt
+          import json, subprocess
+          d = json.loads(subprocess.check_output(["xcrun","simctl","list","-j"]).decode())
+          rts = [r for r in d["runtimes"] if r.get("isAvailable") and r["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS")]
+          rts.sort(key=lambda r: [int(x) for x in r["version"].split(".")])
+          ios16 = [r for r in rts if r["version"].startswith("16")]
+          pick = (ios16 or rts)[-1] if (ios16 or rts) else None
+          print(pick["identifier"] if pick else "")
+          PY
+          RUNTIME_ID="$(cat simout/pick_runtime.txt)"
+          echo "RUNTIME_ID=$RUNTIME_ID"
+          test -n "$RUNTIME_ID" || { echo "ERROR: no iOS simulator runtime available"; exit 1; }
+
+          DEVTYPE="com.apple.CoreSimulator.SimDeviceType.iPhone-14"
+          if ! xcrun simctl list devicetypes | grep -q "iPhone-14 "; then
+            DEVTYPE="$(xcrun simctl list devicetypes | grep -oE 'com\.apple\.CoreSimulator\.SimDeviceType\.iPhone-1[0-9]' | tail -1)"
+          fi
+          echo "DEVTYPE=$DEVTYPE"
+
+          UDID="$(xcrun simctl create pipselftest "$DEVTYPE" "$RUNTIME_ID")"
+          echo "UDID=$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices | grep "$UDID" || true
+
+      - name: Run UNFIXED dylib (expect runtime crash) then FIXED dylib
+        run: |
+          set -uo pipefail
+          UDID="${{ steps.sim.outputs.udid }}"
+          run_one () {
+            tag="$1"; bundleid="$2"; appdir="$3"
+            echo "==================== RUN $tag ===================="
+            xcrun simctl uninstall "$UDID" "$bundleid" >/dev/null 2>&1 || true
+            xcrun simctl install "$UDID" "$appdir"
+            ( xcrun simctl launch --console-pty --terminate-running-process "$UDID" "$bundleid" > "simout/console_${tag}.txt" 2>&1 ) &
+            pid=$!
+            for i in $(seq 1 90); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 2
+            done
+            if kill -0 "$pid" 2>/dev/null; then echo "WATCHDOG: killing hung launch"; kill -9 "$pid" 2>/dev/null; fi
+            wait "$pid" 2>/dev/null; rc=$?
+            echo "launch rc=$rc (tag=$tag)"
+            echo "--- console_${tag}.txt (tail) ---"
+            tail -60 "simout/console_${tag}.txt" || true
+            CONT="$(xcrun simctl get_app_container "$UDID" "$bundleid" data 2>/dev/null || true)"
+            echo "container=$CONT"
+            if [ -n "$CONT" ] && [ -f "$CONT/Documents/pip_selftest_report.txt" ]; then
+              cp "$CONT/Documents/pip_selftest_report.txt" "simout/report_${tag}.txt"
+              echo "===== REPORT $tag ====="
+              cat "simout/report_${tag}.txt"
+            else
+              echo "NO REPORT for $tag (进程可能已崩溃/未写出)"
+            fi
+            echo ""
+          }
+          run_one unfixed com.artex.pipselftest.unfixed simout/TestHostUnfixed.app
+          echo "--- newest host-side crash reports (if any) ---"
+          ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -10 || true
+          mkdir -p simout/crashreports || true
+          cp $(ls -t ~/Library/Logs/DiagnosticReports/TestHost* 2>/dev/null | head -4) simout/crashreports/ 2>/dev/null || true
+
+          run_one fixed com.artex.pipselftest.fixed simout/TestHostFixed.app
+
+      - name: Verify fixed report
+        run: |
+          set -euxo pipefail
+          echo "===== dylib_diff.txt ====="
+          cat simout/dylib_diff.txt || true
+          echo "===== report_fixed.txt ====="
+          cat simout/report_fixed.txt || { echo "ERROR: fixed run produced no report"; exit 1; }
+          grep -q "SELFTEST_RESULT: PASS" simout/report_fixed.txt || { echo "ERROR: SELFTEST_RESULT not PASS"; exit 1; }
+          echo "OK: fixed dylib runtime self-test PASS"
+
+      - name: Upload self-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-simulator-selftest
+          path: simout/**
+          if-no-files-found: warn
+          retention-days: 30

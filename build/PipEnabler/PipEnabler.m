@@ -138,6 +138,16 @@ static NSMutableDictionary<NSString *, NSValue *> *gOriginalFOKOverlayIMPs = nil
 /// 线程局部重入保护：同一帧经多级实现（子类 → 父类）转发时只喂一次。
 static __thread int gPipFeedDepth = 0;
 
+/// ★【#377 运行期缺陷修复】feedSampleBuffer: 的线程局部重入保护。
+/// 原因：feedSampleBuffer: 内部会对 mirrorLayer 调用 -enqueueSampleBuffer:，
+/// 而本模块的【第三重兜底】恰恰 swizzle 了 AVSampleBufferDisplayLayer 的
+/// -enqueueSampleBuffer:（见 PipEnablerInstallSwizzles），该 swizzle 命中后又会
+/// 回调 feedSampleBuffer: —— 若不加保护即形成
+///   feedSampleBuffer: → -enqueueSampleBuffer: → feedSampleBuffer: → ...
+/// 的【无限递归】，运行期在栈上自噬，首帧喂入即 SIGSEGV 崩溃（纯静态
+/// nm/otool/strings 分析无法发现，仅运行期复现，见 #377 模拟器自测）。
+static __thread int gPipFeedSampleDepth = 0;
+
 /// 把一帧 CVPixelBuffer 交给镜像管线（带线程局部重入保护，防止多级转发重复喂帧）。
 #define PIP_ENABLER_FEED_PIXELBUFFER(pb)                                          \
     do {                                                                          \
@@ -673,36 +683,50 @@ API_AVAILABLE(ios(15.0))
     if (!self.enabled || sampleBuffer == NULL) {
         return;
     }
-    AVSampleBufferDisplayLayer *layer = self.mirrorLayer;
-    if (layer == nil) {
-        [self prepareMirrorPipeline];
-        layer = self.mirrorLayer;
-    }
-    if (layer == nil) {
+    // ★【#377 运行期缺陷修复：打断 enqueueSampleBuffer: swizzle 造成的无限递归】
+    //   本方法的正常调用方是 feedPixelBuffer:（帧镜像入口）。但第三重兜底
+    //   swizzle 了 AVSampleBufferDisplayLayer 的 -enqueueSampleBuffer:，因此本方法
+    //   内部对 mirrorLayer 的那次 enqueue 会被 swizzle 命中并【再回调本方法】，
+    //   形成无限递归（首帧即 SIGSEGV）。这里用线程局部标志打断递归：
+    //   递归层（depth>0）直接返回，最外层（depth==0）执行真正的入队与起播逻辑。
+    if (gPipFeedSampleDepth > 0) {
         return;
     }
-    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-        [layer flush];
-    }
-    if ([layer respondsToSelector:@selector(enqueueSampleBuffer:)]) {
-        [layer enqueueSampleBuffer:sampleBuffer];
-    }
-    if (layer.controlTimebase != NULL) {
-        CMTimebaseSetRate(layer.controlTimebase, 1.0);
-    }
-    if (!self.pipActive && self.pipController != nil) {
-        // 帧已开始流入，尝试自动拉起 PiP；若此刻仍不可用，KVO 会在
-        // pictureInPicturePossible 变 YES 后补一次起播。
-        self.pipActive = YES;
-        if (!self.pipController.isPictureInPictureActive) {
-            if ([NSThread isMainThread]) {
-                [self.pipController startPictureInPicture];
-            } else {
-                dispatch_async(dispatch_get_main_queue(), ^{
+    gPipFeedSampleDepth++;
+    @try {
+        AVSampleBufferDisplayLayer *layer = self.mirrorLayer;
+        if (layer == nil) {
+            [self prepareMirrorPipeline];
+            layer = self.mirrorLayer;
+        }
+        if (layer == nil) {
+            return;
+        }
+        if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            [layer flush];
+        }
+        if ([layer respondsToSelector:@selector(enqueueSampleBuffer:)]) {
+            [layer enqueueSampleBuffer:sampleBuffer];
+        }
+        if (layer.controlTimebase != NULL) {
+            CMTimebaseSetRate(layer.controlTimebase, 1.0);
+        }
+        if (!self.pipActive && self.pipController != nil) {
+            // 帧已开始流入，尝试自动拉起 PiP；若此刻仍不可用，KVO 会在
+            // pictureInPicturePossible 变 YES 后补一次起播。
+            self.pipActive = YES;
+            if (!self.pipController.isPictureInPictureActive) {
+                if ([NSThread isMainThread]) {
                     [self.pipController startPictureInPicture];
-                });
+                } else {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self.pipController startPictureInPicture];
+                    });
+                }
             }
         }
+    } @finally {
+        gPipFeedSampleDepth--;
     }
 }
 
