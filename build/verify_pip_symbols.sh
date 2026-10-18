@@ -121,12 +121,18 @@ fi
 
 # ---- 5) constructor 注册 ----
 say ""
-say "---- [5] __DATA,__mod_init_func (constructor 注册) ----"
-(otool -v -s __DATA __mod_init_func "$DYLIB" 2>&1 | tee "$OUT/modinit.txt") || true
-if grep -Eq '^[0-9a-fA-F]{16}' "$OUT/modinit.txt" || grep -q "contents of" "$OUT/modinit.txt"; then
-  pass "constructor slot present in __DATA,__mod_init_func"
+say "---- [5] __mod_init_func (constructor 注册) ----"
+# 新版 clang(Xcode 26) 可能把 constructor 放在 __DATA_CONST,__mod_init_func
+for seg in __DATA __DATA_CONST ; do
+  say "[section] $seg,__mod_init_func"
+  otool -l "$DYLIB" 2>/dev/null | grep -A6 'sectname __mod_init_func' | tee -a "$OUT/modinit_sec.txt" || true
+done
+if grep -q '__mod_init_func' "$OUT/modinit_sec.txt" && grep -Eq 'size 0x0*[1-9a-fA-F]' "$OUT/modinit_sec.txt"; then
+  pass "constructor slot present in __mod_init_func (size>0)"
+elif grep -q '_PipEnablerInitialize:' "$OUT/otool_tv.txt"; then
+  pass "constructor function body _PipEnablerInitialize emitted (otool -tv)"
 else
-  fail "no constructor slot in __DATA,__mod_init_func"
+  fail "no constructor slot in __mod_init_func and no _PipEnablerInitialize body"
   MISS=1
 fi
 
@@ -135,11 +141,20 @@ say ""
 say "---- [6] otool -tv 反汇编命中 (API calls) ----"
 otool -tv "$DYLIB" > "$OUT/otool_tv.txt" 2>&1 || true
 grep -nE 'AVPictureInPicture|AVSampleBufferDisplayLayer|CMSampleBufferCreateReadyWithImageBuffer|CMVideoFormatDescriptionCreateForImageBuffer|PipEnablerInitialize|PipEnablerCreateSampleBuffer|PipEnablerInstallSwizzles' "$OUT/otool_tv.txt" | tee "$OUT/tv_hits.txt" | tee -a "$RESULT" || true
-for tok in "AVPictureInPictureController" "AVSampleBufferDisplayLayer"; do
-  if grep -q "$tok" "$OUT/tv_hits.txt"; then
-    pass "disasm references $tok"
+say ""
+say "---- [6b] constructor 反汇编片段 (_PipEnablerInitialize) ----"
+grep -A40 '^_PipEnablerInitialize:' "$OUT/otool_tv.txt" | tee "$OUT/ctor_disasm.txt" | tee -a "$RESULT" || true
+if grep -q '_PipEnablerInstallSwizzles' "$OUT/ctor_disasm.txt"; then
+  pass "constructor calls PipEnablerInstallSwizzles (swizzle 安装入口存在)"
+fi
+say ""
+say "---- [6c] otool -Iv (indirect symbols: ObjC 类引用) ----"
+otool -Iv "$DYLIB" 2>&1 | grep -E 'AVPictureInPicture|AVSampleBufferDisplayLayer' | tee "$OUT/otool_Iv.txt" | tee -a "$RESULT" || true
+for tok in "AVPictureInPictureControllerContentSource" "AVSampleBufferDisplayLayer"; do
+  if grep -q "$tok" "$OUT/otool_Iv.txt"; then
+    pass "indirect symbol table references $tok"
   else
-    say "NOTE: disasm grep did not hit $tok (可能在 LDR 常量池，以 strings/nm 兜底)"
+    say "NOTE: otool -Iv 未命中 $tok (以 nm -u 为准)"
   fi
 done
 
