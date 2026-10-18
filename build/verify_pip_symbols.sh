@@ -170,6 +170,31 @@ grep -E '_dlopen$|_dlsym$' "$OUT/nm_u.txt" | tee "$OUT/nm_dl.txt" | tee -a "$RES
 if grep -qE '_dlopen$' "$OUT/nm_dl.txt" && grep -qE '_dlsym$' "$OUT/nm_dl.txt"; then pass "dlopen/dlsym 外部引用存在"; else fail "dlopen/dlsym 外部引用缺失"; MISS=1; fi
 
 
+# ---- 11) #378 新增：FOKOverlay 结构体消费点 + CVPixelBuffer 系 C 函数级抓帧 ----
+#   · (f) ObjC 消费点：类型编码 v24@0:8^{FOKOverlay=iiIi^S^*ii^{__CVBuffer}}16（overlay 内嵌 CVPixelBuffer，偏移 +40）
+#   · C 函数级 inline hook：CVPixelBufferGetBaseAddressOfPlane / CVPixelBufferLockBaseAddress /
+#                            CVPixelBufferPoolCreatePixelBuffer（经 libsubstrate MSHookFunction）
+say ""
+say "---- [11] #378 FOKOverlay 消费点 + CVPixelBuffer C 函数级抓帧 ----"
+strings -a "$DYLIB" | grep -E 'FOKOverlay|CVPixelBufferGetBaseAddressOfPlane|CVPixelBufferLockBaseAddress|CVPixelBufferPoolCreatePixelBuffer|cvpb-hook|fokOverlay' | sort -u | tee "$OUT/strings_cvpb.txt" | tee -a "$RESULT" || true
+for tok in "v24@0:8^{FOKOverlay=iiIi^S^*ii^{__CVBuffer}}16" \
+           "CVPixelBufferGetBaseAddressOfPlane" \
+           "CVPixelBufferLockBaseAddress" \
+           "CVPixelBufferPoolCreatePixelBuffer" ; do
+  if grep -qF "$tok" "$OUT/strings_cvpb.txt"; then pass "#378 抓帧标记存在: $tok"; else fail "#378 抓帧标记缺失: $tok"; MISS=1; fi
+done
+say "[11b] #378 抓帧相关符号（含局部符号）:"
+nm "$DYLIB" 2>/dev/null | grep -E 'PipEnabler(InstallCVPixelBufferHooks|SwizzledFOKOverlayConsumer|HookedCVPBGetBaseAddressOfPlane|HookedCVPBLockBaseAddress|HookedCVPBPoolCreatePixelBuffer|ResolveMSHookFunction)' | tee "$OUT/nm_cvpb.txt" | tee -a "$RESULT" || true
+if [ -s "$OUT/nm_cvpb.txt" ]; then
+  pass "#378 抓帧函数符号已生成"
+else
+  say "（注：静态函数符号可能被 ld 剥离，此项不作为硬性判据；以字符串标记为准）"
+fi
+say "[11c] 构造函数反汇编片段（应含 PipEnablerInstallCVPixelBufferHooks）:"
+grep -A80 '^_PipEnablerInitialize:' "$OUT/otool_tv.txt" | tee "$OUT/ctor_disasm_378.txt" | tee -a "$RESULT" || true
+if grep -q '_PipEnablerInstallCVPixelBufferHooks' "$OUT/ctor_disasm_378.txt"; then pass "constructor 调用 PipEnablerInstallCVPixelBufferHooks"; else fail "constructor 未调用 PipEnablerInstallCVPixelBufferHooks"; MISS=1; fi
+
+
 # ---- 8) 汇总 ----
 say ""
 if [ "$MISS" -eq 0 ]; then

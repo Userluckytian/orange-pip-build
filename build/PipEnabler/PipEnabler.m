@@ -76,6 +76,8 @@
 #import <AVKit/AVKit.h>
 #import <UIKit/UIKit.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <string.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 // 仅用于运行时 dlopen/dlsym 取得包内自带 libsubstrate.dylib 的 MSHookFunction
@@ -126,6 +128,12 @@ static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferFactoryIMPs 
 /// （^{__CVBuffer=}24@0:8^{__CVBuffer=}16）。
 static NSMutableSet<NSString *> *gSwizzledCVBufferTransformClasses = nil;
 static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferTransformIMPs = nil;
+
+/// 【本轮新增 #378】(f) ijkplayer 衍生引擎 fok_media_core 的 FOKOverlay 消费方法，
+/// 类型编码 v24@0:8^{FOKOverlay=iiIi^S^*ii^{__CVBuffer}}16。FOKOverlay 是 ijkplayer
+/// SDL_VoutOverlay 的 fok 变体，其结构体内【内嵌 VideoToolbox 硬解出的真实 CVPixelBuffer】。
+static NSMutableSet<NSString *> *gSwizzledFOKOverlayClasses = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gOriginalFOKOverlayIMPs = nil;
 
 /// 线程局部重入保护：同一帧经多级实现（子类 → 父类）转发时只喂一次。
 static __thread int gPipFeedDepth = 0;
@@ -817,6 +825,39 @@ static CVPixelBufferRef PipEnablerSwizzledCVBufferTransform(id self, SEL _cmd, C
     return buffer;
 }
 
+/// (f) 【#378 新增】fok_media_core 的 FOKOverlay 消费方法
+/// 类型编码 v24@0:8^{FOKOverlay=iiIi^S^*ii^{__CVBuffer}}16。
+/// FOKOverlay 是 ijkplayer SDL_VoutOverlay 的 fok 变体。按 arm64 ABI 依类型编码
+/// `i i I i ^S ^* i i ^{__CVBuffer}` 依次还原其【字段偏移】：
+///   +0  int             w
+///   +4  int             h
+///   +8  Uint32          format
+///   +12 int             planes
+///   +16 Uint16 *        pitches       （指针 8 字节对齐）
+///   +24 void *          pixels / 载荷
+///   +32 int             is_private
+///   +36 int             sar_num
+///   +40 CVPixelBufferRef pixelBuffer ←【内嵌的真实解码帧】VideoToolbox 硬解输出
+/// 结构体总大小 = 48 字节；CVPixelBuffer 指针位于偏移 +40。
+/// 该方法是"消费点"（返回 void、仅一个 FOKOverlay* 入参）——生产侧把解码帧塞进
+/// overlay 后交给渲染/上屏，此处读 +40 即拿到真实帧再喂镜像层。
+static void PipEnablerSwizzledFOKOverlayConsumer(id self, SEL _cmd, const void *overlayPtr) {
+    IMP original = PipEnablerLookupOriginalIMP(self, gOriginalFOKOverlayIMPs);
+    // 先于原实现读取内嵌 CVPixelBuffer（原实现可能修改/释放 overlay 内容）。
+    if (overlayPtr != NULL && gPipFeedDepth == 0) {
+        CVPixelBufferRef pb = NULL;
+        // 对齐读（offset 40 为 8 字节对齐），避免非对齐访问。
+        memcpy(&pb, (const uint8_t *)overlayPtr + 40, sizeof(pb));
+        // 校验确实是 CVPixelBuffer，防止结构体该位尚未填充/为脏数据时崩溃。
+        if (pb != NULL && CFGetTypeID(pb) == CVPixelBufferGetTypeID()) {
+            PIP_ENABLER_FEED_PIXELBUFFER(pb);
+        }
+    }
+    if (original != NULL) {
+        ((void (*)(id, SEL, const void *))original)(self, _cmd, overlayPtr);
+    }
+}
+
 /// 遍历全部已注册类，安装真实路径抓帧 swizzle。
 /// 说明：ObjC 类在镜像加载阶段（构造函数之前）即已注册，故此处一次遍历即可覆盖
 ///      Runner 主二进制 / App.framework / Flutter.framework 中定义的所有相关类。
@@ -833,6 +874,8 @@ static void PipEnablerInstallFrameCaptureHooks(void) {
         gOriginalCVBufferFactoryIMPs = [NSMutableDictionary dictionary];
         gSwizzledCVBufferTransformClasses = [NSMutableSet set];
         gOriginalCVBufferTransformIMPs = [NSMutableDictionary dictionary];
+        gSwizzledFOKOverlayClasses = [NSMutableSet set];
+        gOriginalFOKOverlayIMPs = [NSMutableDictionary dictionary];
 
         int classCount = objc_getClassList(NULL, 0);
         if (classCount <= 0) {
@@ -850,6 +893,7 @@ static void PipEnablerInstallFrameCaptureHooks(void) {
         int getterHooked = 0;
         int factoryHooked = 0;
         int transformHooked = 0;
+        int fokOverlayHooked = 0;
         for (int i = 0; i < classCount; i++) {
             Class cls = classes[i];
             NSString *clsName = NSStringFromClass(cls);
@@ -917,13 +961,24 @@ static void PipEnablerInstallFrameCaptureHooks(void) {
                         PIP_LOG(@"(e) hooked transform -[%@ %@] type=^{__CVBuffer=}24@0:8^{__CVBuffer=}16",
                                 clsName, NSStringFromSelector(sel));
                     }
+                } else if (strcmp(enc, "v24@0:8^{FOKOverlay=iiIi^S^*ii^{__CVBuffer}}16") == 0) {
+                    // (f) 【#378】fok_media_core 的 FOKOverlay 消费方法：overlay 内嵌 CVPixelBuffer
+                    //     （结构体偏移 +40，见 PipEnablerSwizzledFOKOverlayConsumer 处注释）
+                    if (PipEnablerInstallSwizzle(cls, clsName, methods[j],
+                                                 (IMP)PipEnablerSwizzledFOKOverlayConsumer,
+                                                 gSwizzledFOKOverlayClasses,
+                                                 gOriginalFOKOverlayIMPs)) {
+                        fokOverlayHooked++;
+                        PIP_LOG(@"(f) hooked FOKOverlay consumer -[%@ %@] type=v24@0:8^{FOKOverlay=...}16",
+                                clsName, NSStringFromSelector(sel));
+                    }
                 }
             }
             free(methods);
         }
         free(classes);
-        PIP_LOG(@"frame capture hooks installed: copyPixelBuffer=%d, cvBufferConsumer=%d, getter=%d, factory=%d, transform=%d",
-                pipHooked, cbufferHooked, getterHooked, factoryHooked, transformHooked);
+        PIP_LOG(@"frame capture hooks installed: copyPixelBuffer=%d, cvBufferConsumer=%d, getter=%d, factory=%d, transform=%d, fokOverlay=%d",
+                pipHooked, cbufferHooked, getterHooked, factoryHooked, transformHooked, fokOverlayHooked);
     });
 }
 
@@ -1022,6 +1077,139 @@ static void PipEnablerInstallCVTextureHook(void) {
     });
 }
 
+#pragma mark - C 函数级补充抓帧 #378：CVPixelBuffer 系（GetBaseAddressOfPlane / LockBaseAddress / PoolCreatePixelBuffer）
+
+// 说明：与 #373 的 CVOpenGLESTextureCacheCreateTextureFromImage 并列，再补三条
+//   主二进制【导入】的 CoreVideo 函数作为 C 级抓帧点（经 libsubstrate MSHookFunction）：
+//     · CVPixelBufferGetBaseAddressOfPlane(pb, planeIndex)  —— 取平面基址前，pb 即真实帧
+//     · CVPixelBufferLockBaseAddress(pb, flags)             —— CPU 访问前，pb 即真实帧
+//     · CVPixelBufferPoolCreatePixelBuffer(alloc, pool, out) —— 输出参数 *out 为新帧
+//   统一经 PIP_ENABLER_FEED_PIXELBUFFER() 喂入镜像层。
+//   ⚠ 这些函数可能被高频调用，这里加一个 ~8ms 的轻量节流（≈125fps 上限，远高于视频帧率，
+//     不会丢真实帧），避免向 AVSampleBufferDisplayLayer 灌入重复样本。
+
+typedef void *(*PipCVPBGetBaseAddressOfPlaneFn)(CVPixelBufferRef pixelBuffer, size_t planeIndex);
+typedef CVReturn (*PipCVPBLockBaseAddressFn)(CVPixelBufferRef pixelBuffer, CVPixelBufferLockFlags flags);
+typedef CVReturn (*PipCVPBPoolCreatePixelBufferFn)(CFAllocatorRef allocator,
+                                                   CVPixelBufferPoolRef pixelBufferPool,
+                                                   CVPixelBufferRef *pixelBufferOut);
+
+static PipCVPBGetBaseAddressOfPlaneFn gPipOrigCVPBGetBaseAddressOfPlane = NULL;
+static PipCVPBLockBaseAddressFn       gPipOrigCVPBLockBaseAddress = NULL;
+static PipCVPBPoolCreatePixelBufferFn gPipOrigCVPBPoolCreatePixelBuffer = NULL;
+
+/// 轻量节流：两次喂帧间隔 <8ms 时跳过（多线程下的 benign 竞争可接受）。
+static CFTimeInterval gPipCBFeedLastTime = 0;
+
+static BOOL PipEnablerCBFeedAllowed(void) {
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - gPipCBFeedLastTime < 0.008) {
+        return NO;
+    }
+    gPipCBFeedLastTime = now;
+    return YES;
+}
+
+static void *PipEnablerHookedCVPBGetBaseAddressOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex) {
+    if (pixelBuffer != NULL && planeIndex == 0 && PipEnablerCBFeedAllowed()) {
+        PIP_ENABLER_FEED_PIXELBUFFER(pixelBuffer);
+    }
+    if (gPipOrigCVPBGetBaseAddressOfPlane != NULL) {
+        return gPipOrigCVPBGetBaseAddressOfPlane(pixelBuffer, planeIndex);
+    }
+    return NULL;
+}
+
+static CVReturn PipEnablerHookedCVPBLockBaseAddress(CVPixelBufferRef pixelBuffer, CVPixelBufferLockFlags flags) {
+    CVReturn ret = kCVReturnSuccess;
+    if (gPipOrigCVPBLockBaseAddress != NULL) {
+        ret = gPipOrigCVPBLockBaseAddress(pixelBuffer, flags);
+    }
+    if (pixelBuffer != NULL && PipEnablerCBFeedAllowed()) {
+        PIP_ENABLER_FEED_PIXELBUFFER(pixelBuffer);
+    }
+    return ret;
+}
+
+static CVReturn PipEnablerHookedCVPBPoolCreatePixelBuffer(CFAllocatorRef allocator,
+                                                          CVPixelBufferPoolRef pixelBufferPool,
+                                                          CVPixelBufferRef *pixelBufferOut) {
+    CVReturn ret = kCVReturnError;
+    if (gPipOrigCVPBPoolCreatePixelBuffer != NULL) {
+        ret = gPipOrigCVPBPoolCreatePixelBuffer(allocator, pixelBufferPool, pixelBufferOut);
+    }
+    if (ret == kCVReturnSuccess && pixelBufferOut != NULL && *pixelBufferOut != NULL) {
+        CVPixelBufferRef pb = *pixelBufferOut;
+        // 仅当该 buffer 已有有效尺寸时才喂（池刚建出的空 buffer 尺寸已定，但尚无像素；
+        // 这里只做类型/非空校验，真实像素由后续 LockBaseAddress/GetBaseAddressOfPlane 覆盖）。
+        if (CFGetTypeID(pb) == CVPixelBufferGetTypeID() && PipEnablerCBFeedAllowed()) {
+            PIP_ENABLER_FEED_PIXELBUFFER(pb);
+        }
+    }
+    return ret;
+}
+
+/// 载入包内 libsubstrate.dylib 并取得 MSHookFunction（若 #373 已装 CVTexture hook 则复用其句柄）。
+static PipMSHookFunctionFn PipEnablerResolveMSHookFunction(void) {
+    if (gPipMSHookFunction != NULL) {
+        return gPipMSHookFunction;
+    }
+    void *handle = dlopen("libsubstrate.dylib", RTLD_NOW | RTLD_NOLOAD);
+    if (handle == NULL) {
+        handle = dlopen("libsubstrate.dylib", RTLD_NOW);
+    }
+    if (handle == NULL) {
+        NSString *bundlePath = [NSBundle mainBundle].bundlePath;
+        if (bundlePath.length > 0) {
+            NSString *p = [bundlePath stringByAppendingPathComponent:@"Frameworks/libsubstrate.dylib"];
+            handle = dlopen(p.fileSystemRepresentation, RTLD_NOW);
+        }
+    }
+    PipMSHookFunctionFn fn = NULL;
+    if (handle != NULL) {
+        fn = (PipMSHookFunctionFn)dlsym(handle, "MSHookFunction");
+    }
+    if (fn == NULL) {
+        fn = (PipMSHookFunctionFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    }
+    gPipMSHookFunction = fn;
+    return fn;
+}
+
+/// 对三条 CVPixelBuffer 系 C 函数安装 inline hook；substrate/符号不可用时安全跳过。
+static void PipEnablerInstallCVPixelBufferHooks(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        PipMSHookFunctionFn hookFn = PipEnablerResolveMSHookFunction();
+        if (hookFn == NULL) {
+            PIP_LOG(@"[cvpb-hook] MSHookFunction unavailable -> skip CVPixelBuffer C-function hooks");
+            return;
+        }
+
+        struct { const char *name; void *hook; void **orig; } targets[] = {
+            { "CVPixelBufferGetBaseAddressOfPlane",
+              (void *)PipEnablerHookedCVPBGetBaseAddressOfPlane,
+              (void **)&gPipOrigCVPBGetBaseAddressOfPlane },
+            { "CVPixelBufferLockBaseAddress",
+              (void *)PipEnablerHookedCVPBLockBaseAddress,
+              (void **)&gPipOrigCVPBLockBaseAddress },
+            { "CVPixelBufferPoolCreatePixelBuffer",
+              (void *)PipEnablerHookedCVPBPoolCreatePixelBuffer,
+              (void **)&gPipOrigCVPBPoolCreatePixelBuffer },
+        };
+
+        for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+            void *sym = dlsym(RTLD_DEFAULT, targets[i].name);
+            if (sym == NULL) {
+                PIP_LOG(@"[cvpb-hook] %s not found -> skip", targets[i].name);
+                continue;
+            }
+            hookFn(sym, targets[i].hook, targets[i].orig);
+            PIP_LOG(@"[cvpb-hook] installed %s=%p orig=%p", targets[i].name, sym, *targets[i].orig);
+        }
+    });
+}
+
 #pragma mark - 运行时插桩：为帧镜像补充通用抓帧点（第三重兜底）
 
 /// 捕获 enqueueSampleBuffer: 的样本（若 App 自身使用 AVSampleBufferDisplayLayer，则可直接镜像）
@@ -1092,6 +1280,8 @@ static void PipEnablerInitialize(void) {
         PipEnablerInstallFrameCaptureHooks();
         // 第三重（机理不同）：C 函数级 inline hook —— CVOpenGLESTextureCacheCreateTextureFromImage
         PipEnablerInstallCVTextureHook();
+        // 第三重补充（#378）：CVPixelBuffer 系 C 函数级 inline hook
+        PipEnablerInstallCVPixelBufferHooks();
 
         __block PipEnablerManager *manager = [PipEnablerManager shared];
         void (^boot)(void) = ^{
