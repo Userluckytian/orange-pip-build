@@ -86,7 +86,8 @@ for tok in \
   "_OBJC_CLASS_\$_AVPlayerLayer" \
   "_CMSampleBufferCreateReadyWithImageBuffer" \
   "_CMVideoFormatDescriptionCreateForImageBuffer" \
-  "_CMSetAttachment" \
+  "_CMSampleBufferGetSampleAttachmentsArray" \
+  "_CFDictionarySetValue" \
   "_CMTimebaseCreateWithSourceClock" \
   "_objc_msgSend" ; do
   if grep -qF "$tok" "$OUT/nm_u.txt"; then

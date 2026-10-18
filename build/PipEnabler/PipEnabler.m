@@ -87,10 +87,14 @@ static CMSampleBufferRef PipEnablerCreateSampleBuffer(CVPixelBufferRef pixelBuff
     }
     // 帧镜像场景下必须"立即显示"：不依赖 controlTimebase 的节拍，
     // 否则在时间轴尚未推进时 display layer 会保留空画面，PiP 无法进入 possible。
-    CMSetAttachment(sampleBuffer,
-                    kCMSampleBufferAttachmentKey_DisplayImmediately,
-                    kCFBooleanTrue,
-                    kCMAttachmentMode_ShouldPropagate);
+    // 注意：DisplayImmediately 是【逐样本】attachment，必须写入样本 attachment 字典。
+    CFArrayRef attachArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
+    if (attachArray != NULL && CFArrayGetCount(attachArray) > 0) {
+        CFMutableDictionaryRef attachDict =
+            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachArray, 0);
+        CFDictionarySetValue(attachDict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+        CFDictionarySetValue(attachDict, kCMSampleAttachmentKey_DoNotDisplay, kCFBooleanFalse);
+    }
     return sampleBuffer;
 }
 
