@@ -19,6 +19,7 @@
 #define PIP_ENABLER_H
 
 #import <Foundation/Foundation.h>
+#import <CoreVideo/CoreVideo.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,11 @@ FOUNDATION_EXPORT void PipEnablerStopPictureInPicture(void);
 /// 运行时探测结果：内容侧是否存在可直接接管的 AVPlayerLayer。
 /// 无则为 nil（本 App 内容侧为 nil，需走帧镜像路径）。
 FOUNDATION_EXPORT id PipEnablerDetectedContentPlayerLayer(void);
+
+/// 主动喂入一帧解码后的像素缓冲（帧镜像路径）。
+/// dylib 内部会从真实播放路径（FlutterTexture 的 -copyPixelBuffer / 原生
+/// CVBuffer 消费方法）自动调用它；导出以便宿主或其它 tweak 复用。
+FOUNDATION_EXPORT void PipEnablerFeedPixelBuffer(CVPixelBufferRef pixelBuffer);
 
 #ifdef __cplusplus
 }

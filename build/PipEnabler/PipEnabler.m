@@ -8,13 +8,13 @@
 //           -fobjc-arc -dynamiclib \
 //           -install_name @executable_path/Frameworks/PipEnabler.dylib \
 //           -framework Foundation -framework AVFoundation -framework AVKit -framework UIKit \
+//           -framework CoreMedia -framework CoreVideo \
 //           PipEnabler.m -o PipEnabler.dylib
 //
-//  原理（见探索事实 #344）:
+//  原理（见探索事实 #344 / #366）:
 //    1) 橘子视频 1.0.6 的内容播放走自研 ijkplayer 衍生引擎 fok_media_core
-//       (OpenGL ES2 渲染 + VideoToolbox 硬解 + Flutter 外部纹理输出)，
-//       整包内不存在 AVPlayerViewController / AVPictureInPictureController，
-//       系统 AVPlayer 仅用于穿山甲/GDT/KS 广告。
+//       (OpenGL ES2 渲染 + VideoToolbox 硬解)，整包内不存在 AVPlayerViewController /
+//       AVPictureInPictureController，系统 AVPlayer 仅用于穿山甲/GDT/KS 广告。
 //    2) 因此分两条路径:
 //       路径 A —— 运行时若探测到可直连的 AVPlayerLayer，直接用它构造
 //                AVPictureInPictureController(contentSource: playerLayer)，原生 PiP。
@@ -23,7 +23,29 @@
 //                AVSampleBufferDisplayLayer，再以
 //                AVPictureInPictureController(contentSource: sampleBufferDisplayLayer)
 //                启动系统 PiP（帧镜像 / frame mirror 方案）。
-//    3) 全部使用公开 API，不含任何私有符号；所有新 API 调用均以
+//    3) 【本轮新增：真实帧源接入】#366 第(7)点指出旧实现唯一的抓帧点是
+//       swizzle AVSampleBufferDisplayLayer.enqueueSampleBuffer:，而本 App 内容播放
+//       并不经过 AVSampleBufferDisplayLayer，故该 swizzle 对真实视频永不触发，
+//       导出的 PipEnablerFeedPixelBuffer 也没有任何调用方 —— 镜像层拿不到真实帧，
+//       系统 PiP 无法对实际视频起播。
+//       本轮在【真实解码/渲染路径】上补两个通用抓帧点（纯 Objective-C 运行时，
+//       无需 substrate / 无 C 符号 ABI 风险）：
+//         (a) Flutter 外部纹理：App 用 Flutter 的 Texture widget 上屏
+//             (SceneBuilder::addTexture / TEXTURE_VIEW)，Flutter 引擎每帧会对注册的
+//             FlutterTexture 对象调用 -copyPixelBuffer 取回 CVPixelBuffer。
+//             运行时遍历全部已注册类，把【自身实现 copyPixelBuffer 且返回类型为
+//             CVBuffer/CVPixelBuffer】的类一并 swizzle，取回每帧像素缓冲。
+//         (b) 原生渲染视图：部分渲染模式下像素缓冲直接交给原生视图
+//             (FOKContentPixelBufferViewProtocol)。遍历全部类，把签名恰为
+//             "v24@0:8^{__CVBuffer=}16"（返回 void、仅一个 CVBuffer 参数）的
+//             消费型方法一并 swizzle。
+//       两个抓帧点都调用导出的 PipEnablerFeedPixelBuffer()，从而让"镜像层"持续
+//       拿到真实帧 → CMSampleBuffer → AVSampleBufferDisplayLayer，使
+//       AVPictureInPictureControllerContentSource(sampleBufferDisplayLayer:) 在
+//       iOS 16.6.1 上对【实际视频】可进入 pictureInPicturePossible 并起播。
+//       同时保留原有 enqueueSampleBuffer: swizzle（对走 sample buffer 的
+//       播放器仍然有效）作为第三重兜底。
+//    4) 全部使用公开 API，不含任何私有符号；所有新 API 调用均以
 //       respondsToSelector / @available 兜底，保证 iOS 15.0 ~ 16.6.1 可编译可运行。
 //
 //  导出符号严格与 PipEnabler.h 一致:
@@ -31,8 +53,11 @@
 //    PipEnablerStartPictureInPicture() / PipEnablerStopPictureInPicture()
 //    PipEnablerDetectedContentPlayerLayer()
 //    PipEnablerEnabledDidChangeNotification (NSNotificationName)
+//    PipEnablerFeedPixelBuffer(CVPixelBufferRef)
 //
 //  运行时开关 : NSUserDefaults key "PipEnablerEnabled" (BOOL)。
+//              ★ 未显式设置时默认【开启】(见 PIP_ENABLER_DEFAULT_ENABLED)，
+//                以保证注入后画中画对真实视频开箱即用。
 //              修改后 post PipEnablerEnabledDidChangeNotification 通知。
 //  自动装载   : __attribute__((constructor))，dylib 注入后立即生效。
 //
@@ -40,7 +65,9 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AVKit/AVKit.h>
 #import <UIKit/UIKit.h>
+#import <CoreVideo/CoreVideo.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #pragma mark - 常量与全局
 
@@ -50,8 +77,29 @@ NSNotificationName const PipEnablerEnabledDidChangeNotification = @"PipEnablerEn
 /// NSUserDefaults 开关 key
 static NSString * const kPipEnablerEnabledKey = @"PipEnablerEnabled";
 
-/// 镜像渲染用的小宿主视图尺寸（PiP 层不需要真正可见，挂到窗口上有助于部分 iOS 版本正确驱动渲染）
+/// 缺省使能状态：未显式写入 NSUserDefaults 时默认开启，
+/// 否则注入 dylib 后帧镜像管线不会启动，画中画对真实视频依旧不可用。
+static const BOOL PIP_ENABLER_DEFAULT_ENABLED = YES;
+
+/// 镜像渲染用的小宿主视图尺寸（PiP 层需真正可见，挂到窗口上有助于部分 iOS 版本正确驱动渲染）
 static const CGFloat kPipMirrorHostViewSize = 2.0;
+
+/// 统一日志前缀
+#define PIP_LOG(fmt, ...) NSLog(@"[PipEnabler] " fmt, ##__VA_ARGS__)
+
+#pragma mark - 前向声明
+
+/// 导出的主动喂帧入口（本文件内多个抓帧点都会调用它）
+FOUNDATION_EXPORT void PipEnablerFeedPixelBuffer(CVPixelBufferRef pixelBuffer);
+
+/// 抓帧所需的全局状态
+static NSMutableSet<NSString *> *gSwizzledCopyPixelBufferClasses = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gOriginalCopyPixelBufferIMPs = nil;
+static NSMutableSet<NSString *> *gSwizzledCVBufferConsumerClasses = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gOriginalCVBufferConsumerIMPs = nil;
+
+/// 线程局部重入保护：同一帧经多级实现（子类 → 父类）转发时只喂一次。
+static __thread int gPipFeedDepth = 0;
 
 #pragma mark - C 工具函数
 
@@ -263,7 +311,14 @@ API_AVAILABLE(ios(15.0))
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _enabled = [NSUserDefaults.standardUserDefaults boolForKey:kPipEnablerEnabledKey];
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        if ([defaults objectForKey:kPipEnablerEnabledKey] == nil) {
+            // 未显式配置 → 默认开启，保证注入即生效
+            _enabled = PIP_ENABLER_DEFAULT_ENABLED;
+        } else {
+            _enabled = [defaults boolForKey:kPipEnablerEnabledKey];
+        }
+        PIP_LOG(@"manager init, enabled=%d", (int)_enabled);
     }
     return self;
 }
@@ -408,6 +463,7 @@ API_AVAILABLE(ios(15.0))
                 [keyWindow addSubview:host];       // 置于屏内(0,0) 2x2，肉眼不可见但参与渲染
                 [keyWindow bringSubviewToFront:host];
                 self.mirrorHostView = host;
+                PIP_LOG(@"mirror host view attached to keyWindow");
             }
         });
     }
@@ -433,6 +489,7 @@ API_AVAILABLE(ios(15.0))
                 [[AVPictureInPictureController alloc] initWithContentSource:src];
             [self configureAutoStartForController:controller];
             self.pipController = controller;
+            PIP_LOG(@"mirror PiP controller created (sampleBufferDisplayLayer content source)");
         }
     }
 }
@@ -467,6 +524,7 @@ API_AVAILABLE(ios(15.0))
             self.pipController.isPictureInPicturePossible &&
             !self.pipController.isPictureInPictureActive) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                PIP_LOG(@"pictureInPicturePossible=YES -> startPictureInPicture");
                 [self.pipController startPictureInPicture];
             });
         }
@@ -597,7 +655,155 @@ API_AVAILABLE(ios(15.0))
 
 @end
 
-#pragma mark - 运行时插桩：为帧镜像补充通用抓帧点
+#pragma mark - 真实播放路径抓帧（Flutter 外部纹理 / 原生 CVBuffer 消费）
+
+/// 从实例的真实类沿继承链向上，找到我们记录过的原始 IMP。
+static IMP PipEnablerLookupOriginalIMP(id object, NSMutableDictionary<NSString *, NSValue *> *originals) {
+    Class cls = object_getClass(object);
+    while (cls != Nil) {
+        NSValue *value = originals[NSStringFromClass(cls)];
+        if (value != nil) {
+            return (IMP)[value pointerValue];
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return NULL;
+}
+
+/// 统一的 swizzle 安装器：只对【自己拥有该方法】的类安装一次。
+static BOOL PipEnablerInstallSwizzle(Class cls,
+                                     NSString *clsName,
+                                     Method method,
+                                     IMP replacement,
+                                     NSMutableSet<NSString *> *done,
+                                     NSMutableDictionary<NSString *, NSValue *> *originals) {
+    if (cls == Nil || method == NULL || clsName.length == 0 || replacement == NULL) {
+        return NO;
+    }
+    if (done == nil || originals == nil) {
+        return NO;
+    }
+    IMP current = method_getImplementation(method);
+    if (current == replacement || current == NULL) {
+        return NO;
+    }
+    if ([done containsObject:clsName]) {
+        return NO;
+    }
+    [done addObject:clsName];
+    originals[clsName] = [NSValue valueWithPointer:current];
+    method_setImplementation(method, replacement);
+    return YES;
+}
+
+/// (a) FlutterTexture 的 -copyPixelBuffer：每帧被 Flutter 引擎调用取回 CVPixelBuffer。
+static CVPixelBufferRef PipEnablerSwizzledCopyPixelBuffer(id self, SEL _cmd) {
+    IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCopyPixelBufferIMPs);
+    if (original == NULL) {
+        return NULL;
+    }
+    CVPixelBufferRef pixelBuffer = ((CVPixelBufferRef (*)(id, SEL))original)(self, _cmd);
+    if (pixelBuffer != NULL && gPipFeedDepth == 0) {
+        gPipFeedDepth++;
+        @try {
+            if ([[PipEnablerManager shared] isEnabled]) {
+                // 经导出入口喂入镜像层
+                PipEnablerFeedPixelBuffer(pixelBuffer);
+            }
+        } @finally {
+            gPipFeedDepth--;
+        }
+    }
+    return pixelBuffer;
+}
+
+/// (b) 原生渲染视图的 CVBuffer 消费型方法（返回 void、仅一个 CVBuffer 参数）。
+static void PipEnablerSwizzledCVBufferConsumer(id self, SEL _cmd, CVBufferRef buffer) {
+    IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCVBufferConsumerIMPs);
+    if (original != NULL) {
+        ((void (*)(id, SEL, CVBufferRef))original)(self, _cmd, buffer);
+    }
+    if (buffer != NULL && gPipFeedDepth == 0) {
+        gPipFeedDepth++;
+        @try {
+            if ([[PipEnablerManager shared] isEnabled]) {
+                PipEnablerFeedPixelBuffer((CVPixelBufferRef)buffer);
+            }
+        } @finally {
+            gPipFeedDepth--;
+        }
+    }
+}
+
+/// 遍历全部已注册类，安装真实路径抓帧 swizzle。
+/// 说明：ObjC 类在镜像加载阶段（构造函数之前）即已注册，故此处一次遍历即可覆盖
+///      Runner 主二进制 / App.framework / Flutter.framework 中定义的所有相关类。
+static void PipEnablerInstallFrameCaptureHooks(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gSwizzledCopyPixelBufferClasses = [NSMutableSet set];
+        gOriginalCopyPixelBufferIMPs = [NSMutableDictionary dictionary];
+        gSwizzledCVBufferConsumerClasses = [NSMutableSet set];
+        gOriginalCVBufferConsumerIMPs = [NSMutableDictionary dictionary];
+
+        int classCount = objc_getClassList(NULL, 0);
+        if (classCount <= 0) {
+            PIP_LOG(@"frame capture: no classes found");
+            return;
+        }
+        Class *classes = (Class *)calloc((size_t)classCount, sizeof(Class));
+        if (classes == NULL) {
+            return;
+        }
+        classCount = objc_getClassList(classes, classCount);
+
+        int pipHooked = 0;
+        int cbufferHooked = 0;
+        for (int i = 0; i < classCount; i++) {
+            Class cls = classes[i];
+            NSString *clsName = NSStringFromClass(cls);
+            if (clsName.length == 0) {
+                continue;
+            }
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(cls, &methodCount);
+            if (methods == NULL) {
+                continue;
+            }
+            for (unsigned int j = 0; j < methodCount; j++) {
+                SEL sel = method_getName(methods[j]);
+                const char *enc = method_getTypeEncoding(methods[j]);
+                if (enc == NULL) {
+                    continue;
+                }
+                if (sel == @selector(copyPixelBuffer) && strstr(enc, "CVBuffer") != NULL) {
+                    if (PipEnablerInstallSwizzle(cls, clsName, methods[j],
+                                                 (IMP)PipEnablerSwizzledCopyPixelBuffer,
+                                                 gSwizzledCopyPixelBufferClasses,
+                                                 gOriginalCopyPixelBufferIMPs)) {
+                        pipHooked++;
+                        PIP_LOG(@"(a) hooked -[%@ copyPixelBuffer]" , clsName);
+                    }
+                } else if (strcmp(enc, "v24@0:8^{__CVBuffer=}16") == 0 ||
+                           strcmp(enc, "v24@0:8^{__CVPixelBuffer=}16") == 0) {
+                    if (PipEnablerInstallSwizzle(cls, clsName, methods[j],
+                                                 (IMP)PipEnablerSwizzledCVBufferConsumer,
+                                                 gSwizzledCVBufferConsumerClasses,
+                                                 gOriginalCVBufferConsumerIMPs)) {
+                        cbufferHooked++;
+                        PIP_LOG(@"(b) hooked -[%@ %@]", clsName, NSStringFromSelector(sel));
+                    }
+                }
+            }
+            free(methods);
+        }
+        free(classes);
+        PIP_LOG(@"frame capture hooks installed: copyPixelBuffer=%d, cvBufferConsumer=%d",
+                pipHooked, cbufferHooked);
+    });
+}
+
+#pragma mark - 运行时插桩：为帧镜像补充通用抓帧点（第三重兜底）
 
 /// 捕获 enqueueSampleBuffer: 的样本（若 App 自身使用 AVSampleBufferDisplayLayer，则可直接镜像）
 static IMP gOriginalEnqueueSampleBufferIMP = NULL;
@@ -651,7 +857,7 @@ CALayer *PipEnablerDetectedContentPlayerLayer(void) {
     return [[PipEnablerManager shared] detectedContentPlayerLayer];
 }
 
-/// 附加导出：供宿主/其它 tweak 主动喂帧（帧镜像路径使用）
+/// 附加导出：供抓帧点 / 宿主 / 其它 tweak 主动喂帧（帧镜像路径使用）
 void PipEnablerFeedPixelBuffer(CVPixelBufferRef pixelBuffer) {
     [[PipEnablerManager shared] feedPixelBuffer:pixelBuffer];
 }
@@ -661,7 +867,10 @@ void PipEnablerFeedPixelBuffer(CVPixelBufferRef pixelBuffer) {
 __attribute__((constructor))
 static void PipEnablerInitialize(void) {
     @autoreleasepool {
+        // 第一重：sample buffer 播放器兜底
         PipEnablerInstallSwizzles();
+        // 第二/三重：真实解码/渲染路径抓帧（Flutter 外部纹理 + 原生 CVBuffer 消费）
+        PipEnablerInstallFrameCaptureHooks();
 
         __block PipEnablerManager *manager = [PipEnablerManager shared];
         void (^boot)(void) = ^{
@@ -690,6 +899,7 @@ static void PipEnablerInitialize(void) {
                 }
             }];
             [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+            PIP_LOG(@"boot complete, enabled=%d", (int)[manager isEnabled]);
         };
 
         if ([NSThread isMainThread]) {

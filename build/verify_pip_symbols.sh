@@ -131,6 +131,26 @@ for tok in "AVPictureInPictureController" "AVSampleBufferDisplayLayer" "enqueueS
   if grep -qF "$tok" "$OUT/strings.txt"; then pass "字符串存在: $tok"; else fail "字符串缺失: $tok"; fi
 done
 
+# ---- 9) 真实播放路径抓帧逻辑（#370 新增） ----
+# 证明 dylib 内已编译进"从真实解码/渲染路径抓帧"的逻辑：
+#   (a) FlutterTexture 的 -copyPixelBuffer（Flutter 外部纹理每帧回调）
+#   (b) 返回 void、仅一个 CVBuffer 参数的原生消费型方法
+say ""
+say "---- [9] 真实路径抓帧逻辑 (copyPixelBuffer / CVBuffer consumer) ----"
+strings -a "$DYLIB" | grep -E 'copyPixelBuffer|CVBuffer|frame capture hooks installed|\[PipEnabler\]' | sort -u | tee "$OUT/strings_framecap.txt" | tee -a "$RESULT" || true
+for tok in "copyPixelBuffer" "v24@0:8^{__CVBuffer=}16" "frame capture hooks installed"; do
+  if grep -qF "$tok" "$OUT/strings_framecap.txt"; then pass "抓帧标记存在: $tok"; else fail "抓帧标记缺失: $tok"; MISS=1; fi
+done
+say "[9b] 抓帧相关符号（含局部符号）:"
+nm "$DYLIB" 2>/dev/null | grep -E 'PipEnabler(InstallFrameCaptureHooks|SwizzledCopyPixelBuffer|SwizzledCVBufferConsumer|FeedPixelBuffer)' | tee "$OUT/nm_framecap.txt" | tee -a "$RESULT" || true
+if [ -s "$OUT/nm_framecap.txt" ]; then
+  pass "抓帧函数符号已生成"
+else
+  say "（注：静态函数符号可能被 ld 剥离，此项不作为硬性判据；以字符串标记为准）"
+fi
+say "[9c] 反汇编中构造函数调用帧抓取安装点:"
+grep -nE 'PipEnablerInstallFrameCaptureHooks|PipEnablerInstallSwizzles' "$OUT/otool_tv.txt" | tee -a "$RESULT" || true
+
 # ---- 8) 汇总 ----
 say ""
 if [ "$MISS" -eq 0 ]; then
