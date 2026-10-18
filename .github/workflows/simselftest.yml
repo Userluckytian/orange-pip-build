@@ -29,7 +29,7 @@ concurrency:
 jobs:
   simselftest:
     name: iOS Simulator runtime self-test (dlopen PipEnabler.dylib)
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 60
 
     steps:
