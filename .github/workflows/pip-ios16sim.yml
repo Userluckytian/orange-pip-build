@@ -61,24 +61,74 @@ jobs:
         id: provision
         continue-on-error: true
         run: |
+          set +e
           mkdir -p simout
           LOG="simout/runtime_provision.log"
           exec > >(tee -a "$LOG") 2>&1
           set -x
           have16 () { xcrun simctl list runtimes | grep -E 'iOS 16\.' || true; }
-          for V in 16.6 16.6.1 16.4 16.2 16.1 16.0; do
-            if [ -n "$(have16)" ]; then echo "already have an iOS 16 runtime"; break; fi
-            echo "===== try: xcodebuild -downloadPlatform iOS -buildVersion $V ====="
-            timeout 1800 xcodebuild -downloadPlatform iOS -buildVersion "$V"
-            rc=$?
-            echo "download rc=$rc (buildVersion=$V)"
+          have_any16 () { [ -n "$(have16)" ]; }
+          # macOS 无 GNU timeout，用 perl alarm 兜底
+          to () { local t="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$t" "$@"; }
+
+          echo "===== installed Xcode bundles ====="
+          ls -1 /Applications 2>/dev/null | grep -i '^Xcode' || true
+
+          try_version () {
+            local XC="$1"; local V="$2"
+            echo "----- try Xcode=[$XC] buildVersion=$V -----"
+            if [ -n "$XC" ]; then
+              sudo xcode-select -s "/Applications/${XC}/Contents/Developer" || true
+            fi
+            xcodebuild -version || true
+            to 1500 xcodebuild -downloadPlatform iOS -buildVersion "$V"
+            echo "xcodebuild rc=$? (buildVersion=$V)"
             xcrun simctl list runtimes | grep -E 'iOS 16\.' || true
+          }
+
+          echo "===== [A] current Xcode: -downloadPlatform iOS -buildVersion <V> ====="
+          for V in 16.6 16.6.1 16.4 16.2 16.1 16.0; do
+            have_any16 && { echo "already have an iOS 16 runtime"; break; }
+            try_version "" "$V"
           done
+
+          echo "===== [B] other installed Xcode 16.x: same flag ====="
+          if ! have_any16; then
+            for XC in $(ls -1 /Applications 2>/dev/null | grep -E '^Xcode_16' | sort -r); do
+              have_any16 && break
+              xcodebuild -help 2>&1 | grep -i -A2 'buildVersion' || true
+              try_version "$XC" "16.6"
+              have_any16 && break
+              try_version "$XC" "16.4"
+            done
+          fi
+
+          echo "===== [C] exportPath variant (dmg only) ====="
+          if ! have_any16; then
+            to 900 xcodebuild -downloadPlatform iOS -exportPath /tmp/rt166 -buildVersion 16.6
+            echo "export rc=$?"
+            ls -la /tmp/rt166 2>/dev/null || true
+          fi
+
+          echo "===== [D] xcrun simctl runtime add usage ====="
+          xcrun simctl runtime add --help 2>&1 | head -40 || true
+          xcrun simctl runtime list 2>&1 | head -40 || true
+
+          echo "===== [E] anonymous CDN reachability for old iOS runtime dmgs ====="
+          for U in \
+            "https://download.developer.apple.com/Developer_Tools/iOS_16.6_Simulator_Runtime/iOS_16.6_Simulator_Runtime.dmg" \
+            "https://download.developer.apple.com/Developer_Tools/iOS_16.4_Simulator_Runtime/iOS_16.4_Simulator_Runtime.dmg" \
+            "https://download.developer.apple.com/Developer_Tools/Xcode_14.3.1/Xcode_14.3.1.xip" ; do
+            echo "HEAD $U"
+            curl -sS -I -m 30 -o /dev/null -w "http_code=%{http_code}\n" "$U" || echo "curl failed rc=$?"
+          done
+
           echo "===== runtimes after provisioning ====="
           xcrun simctl list runtimes || true
           N="$(have16 | wc -l | tr -d ' ')"
           echo "ios16_runtime_lines=$N"
           echo "ios16_runtime_lines=$N" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Build PipEnabler.dylib for iOS Simulator (fixed + unfixed)
         run: |
