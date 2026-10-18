@@ -138,6 +138,21 @@ jobs:
           echo "===== RESULT.txt ====="
           cat verify_out/RESULT.txt
 
+      - name: Check minimum OS version (iOS 16.6.1 installability)
+        run: |
+          set -uxo pipefail
+          APP="verify_out/_unzip/Payload/Runner.app"
+          if [ ! -d "$APP" ]; then echo "app bundle not found at $APP"; exit 0; fi
+          MAIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" 2>/dev/null || echo Runner)"
+          echo "===== main binary: $APP/$MAIN ====="
+          file "$APP/$MAIN" || true
+          otool -l "$APP/$MAIN" | grep -A5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
+          echo "===== PipEnabler.dylib ====="
+          file "$APP/Frameworks/PipEnabler.dylib" || true
+          otool -l "$APP/Frameworks/PipEnabler.dylib" | grep -A5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
+          echo "===== raw dump (LC_BUILD_VERSION context) ====="
+          otool -l "$APP/Frameworks/PipEnabler.dylib" | grep -B1 -A8 -E 'LC_BUILD_VERSION' || true
+
       - name: Upload PiP verification evidence
         uses: actions/upload-artifact@v4
         with:
