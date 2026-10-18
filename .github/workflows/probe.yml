@@ -1,0 +1,13 @@
+﻿name: probe
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: greet
+        run: |
+          echo "actions channel OK"
+          uname -a
