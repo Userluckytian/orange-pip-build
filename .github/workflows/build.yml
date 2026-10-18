@@ -142,7 +142,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pip-symbol-verification
-          path: verify_out
+          path: verify_out/*.txt
           if-no-files-found: warn
           retention-days: 30
 
