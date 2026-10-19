@@ -504,10 +504,13 @@ API_AVAILABLE(ios(15.0))
 
 - (void)setEnabled:(BOOL)enabled {
     PipEnablerDiagLog(@"bc setEnabled: enter, target=%d", (int)enabled);
-    if (self.enabled == enabled) {
+    // [P2 hotfix] `self.enabled = enabled` re-entered THIS method, because
+    // -setEnabled: is the setter of the `enabled` property -> infinite recursion -> crash.
+    // Assign the backing ivar directly instead.
+    if (_enabled == enabled) {
         return;
     }
-    self.enabled = enabled;
+    _enabled = enabled;
     PipEnablerDiagLog(@"bc setEnabled: state updated, persisting");
     [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kPipEnablerEnabledKey];
     [NSUserDefaults.standardUserDefaults synchronize];
