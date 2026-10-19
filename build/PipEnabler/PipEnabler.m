@@ -214,6 +214,86 @@ static double PipEnablerAverageLuma(CVPixelBufferRef pb) {
     return sum / (double)n / 255.0;
 }
 
+#pragma mark - 抓帧来源统计（v6：定位黑帧来源）
+
+/// 当前喂帧来源标记，由各个 hook 在喂帧前设置
+static const char *gPipFeedSourceTag = "other";
+
+typedef struct {
+    const char *name;
+    CFTimeInterval lastFeed;
+    NSUInteger total;
+    NSUInteger black;
+    double lastMaxY;
+} PipFeedSourceStat;
+
+static PipFeedSourceStat gPipFeedSourceStats[10];
+static int gPipFeedSourceStatCount = 0;
+
+static PipFeedSourceStat *PipEnablerFeedSourceStat(const char *name) {
+    for (int i = 0; i < gPipFeedSourceStatCount; i++) {
+        if (strcmp(gPipFeedSourceStats[i].name, name) == 0) {
+            return &gPipFeedSourceStats[i];
+        }
+    }
+    if (gPipFeedSourceStatCount < 10) {
+        PipFeedSourceStat *s = &gPipFeedSourceStats[gPipFeedSourceStatCount++];
+        s->name = name;
+        s->lastFeed = 0;
+        s->total = 0;
+        s->black = 0;
+        s->lastMaxY = -1;
+        return s;
+    }
+    return NULL;
+}
+
+/// 逐来源的亮度统计：min / max / avg（Y 平面）。max 接近 16 即为纯黑帧。
+static BOOL PipEnablerLumaStats(CVPixelBufferRef pb, double *outMin, double *outMax, double *outAvg) {
+    if (pb == NULL) { return NO; }
+    if (CVPixelBufferGetWidth(pb) == 0 || CVPixelBufferGetHeight(pb) == 0) { return NO; }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return NO;
+    }
+    double mn = 255.0, mx = 0.0, sum = 0.0;
+    NSUInteger n = 0;
+    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (base != NULL) {
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        size_t pw = CVPixelBufferGetWidthOfPlane(pb, 0);
+        size_t ph = CVPixelBufferGetHeightOfPlane(pb, 0);
+        size_t stepY = (ph / 12 > 0) ? ph / 12 : 1;
+        size_t stepX = (pw / 12 > 0) ? pw / 12 : 1;
+        for (size_t y = 0; y < ph; y += stepY) {
+            for (size_t x = 0; x < pw; x += stepX) {
+                double v = (double)base[y * bpr + x];
+                if (v < mn) { mn = v; }
+                if (v > mx) { mx = v; }
+                sum += v;
+                n++;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (n == 0) { return NO; }
+    if (outMin) { *outMin = mn; }
+    if (outMax) { *outMax = mx; }
+    if (outAvg) { *outAvg = sum / (double)n; }
+    return YES;
+}
+
+/// 各来源统计摘要（给诊断浮层用）
+static NSString *PipEnablerFeedSourceSummary(void) {
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < gPipFeedSourceStatCount; i++) {
+        PipFeedSourceStat *st = &gPipFeedSourceStats[i];
+        [s appendFormat:@"%s: fed=%lu black=%lu maxY=%.0f\n",
+            st->name, (unsigned long)st->total, (unsigned long)st->black, st->lastMaxY];
+    }
+    if (gPipFeedSourceStatCount == 0) { [s appendString:@"\n(no capture source fired)\n"]; }
+    return s;
+}
+
 #pragma mark - 前向声明
 
 /// 导出的主动喂帧入口（本文件内多个抓帧点都会调用它）
@@ -996,6 +1076,8 @@ API_AVAILABLE(ios(15.0))
         (long)(self.mirrorLayer ? self.mirrorLayer.status : -1),
         self.diagLastLuma,
         (unsigned long)self.diagFedFrames, (unsigned long)self.diagEnqueuedFrames];
+    [s appendString:@"--- capture sources ---\n"];
+    [s appendString:PipEnablerFeedSourceSummary()];
     return s;
 }
 
@@ -1112,18 +1194,39 @@ API_AVAILABLE(ios(15.0))
         self.frameCaptureConfirmed = YES;
         PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
     }
-    // [P4] luma 恒为 0 说明抓到的是全黑缓冲（抓帧点不对）；
-    //       luma 明显大于 0 说明画面素材是好的（问题在 PiP 通道）。
-    self.diagLastLuma = PipEnablerAverageLuma(pixelBuffer);
-    if (self.diagLumaSamples < 5) {
-        self.diagLumaSamples += 1;
-        OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
-        PipEnablerDiagLog(@"P4: frame#%lu luma=%.4f size=%zux%zu fmt=%c%c%c%c iosurface=%d",
-                          (unsigned long)self.diagLumaSamples, self.diagLastLuma,
-                          CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
-                          (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
-                          (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF),
-                          (int)(CVPixelBufferGetIOSurface(pixelBuffer) != NULL));
+    // [v6] Black-frame filter. A buffer whose MAXIMUM Y is still at the black level
+    // carries no picture; feeding it is what kept the PiP window black.
+    double mn = 0, mx = 0, avg = 0;
+    if (PipEnablerLumaStats(pixelBuffer, &mn, &mx, &avg)) {
+        self.diagLastLuma = avg / 255.0;
+        PipFeedSourceStat *st = PipEnablerFeedSourceStat(gPipFeedSourceTag);
+        if (mx < 40.0) {
+            // essentially black -> do not feed
+            if (st != NULL) {
+                st->black += 1;
+                st->lastMaxY = mx;
+            }
+            if (self.diagLumaSamples < 3 || (st != NULL && (st->black % 50) == 0)) {
+                self.diagLumaSamples += 1;
+                PipEnablerDiagLog(@"v6: skip black frame src=%s maxY=%.0f avgY=%.0f (black=%lu)",
+                                  gPipFeedSourceTag, mx, avg,
+                                  (unsigned long)(st ? st->black : 0));
+            }
+            return;
+        }
+        if (st != NULL) {
+            st->total += 1;
+            st->lastMaxY = mx;
+        }
+        if (self.diagLumaSamples < 8) {
+            self.diagLumaSamples += 1;
+            OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+            PipEnablerDiagLog(@"v6: GOOD frame src=%s minY=%.0f maxY=%.0f avgY=%.0f size=%zux%zu fmt=%c%c%c%c",
+                              gPipFeedSourceTag, mn, mx, avg,
+                              CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+                              (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
+                              (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF));
+        }
     }
 }
 
@@ -1289,6 +1392,7 @@ static CVPixelBufferRef PipEnablerSwizzledCVBufferGetter(id self, SEL _cmd) {
         return NULL;
     }
     CVPixelBufferRef pb = ((CVPixelBufferRef (*)(id, SEL))original)(self, _cmd);
+    gPipFeedSourceTag = "getter";
     PIP_ENABLER_FEED_PIXELBUFFER(pb);
     return pb;
 }
@@ -1297,6 +1401,7 @@ static CVPixelBufferRef PipEnablerSwizzledCVBufferGetter(id self, SEL _cmd) {
 /// 入参即解码后的帧；先喂帧再调用原实现。
 static id PipEnablerSwizzledCVBufferFactory(id self, SEL _cmd, CVPixelBufferRef buffer) {
     IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCVBufferFactoryIMPs);
+    gPipFeedSourceTag = "factory";
     PIP_ENABLER_FEED_PIXELBUFFER(buffer);
     if (original != NULL) {
         return ((id (*)(id, SEL, CVPixelBufferRef))original)(self, _cmd, buffer);
@@ -1308,9 +1413,11 @@ static id PipEnablerSwizzledCVBufferFactory(id self, SEL _cmd, CVPixelBufferRef 
 /// （^{__CVBuffer=}24@0:8^{__CVBuffer=}16）；入参与返回值都可能是真实帧。
 static CVPixelBufferRef PipEnablerSwizzledCVBufferTransform(id self, SEL _cmd, CVPixelBufferRef buffer) {
     IMP original = PipEnablerLookupOriginalIMP(self, gOriginalCVBufferTransformIMPs);
+    gPipFeedSourceTag = "transform";
     PIP_ENABLER_FEED_PIXELBUFFER(buffer);
     if (original != NULL) {
         CVPixelBufferRef out = ((CVPixelBufferRef (*)(id, SEL, CVPixelBufferRef))original)(self, _cmd, buffer);
+        gPipFeedSourceTag = "transform2";
         PIP_ENABLER_FEED_PIXELBUFFER(out);
         return out;
     }
@@ -1342,6 +1449,7 @@ static void PipEnablerSwizzledFOKOverlayConsumer(id self, SEL _cmd, const void *
         memcpy(&pb, (const uint8_t *)overlayPtr + 40, sizeof(pb));
         // 校验确实是 CVPixelBuffer，防止结构体该位尚未填充/为脏数据时崩溃。
         if (pb != NULL && CFGetTypeID(pb) == CVPixelBufferGetTypeID()) {
+            gPipFeedSourceTag = "fok";
             PIP_ENABLER_FEED_PIXELBUFFER(pb);
         }
     }
@@ -1513,6 +1621,7 @@ static CVReturn PipEnablerHookedCVTextureFromImage(CFAllocatorRef allocator, CFT
     if (planeIndex == 0 && sourceImage != NULL) {
         // 该 C 函数不是 Objective-C 方法，不能用 gPipFeedDepth 的 @try/@finally 语义，
         // 但重入保护同样有效（喂帧过程内部若再次调用本函数会因 depth>0 直接跳过）。
+        gPipFeedSourceTag = "cvtex";
         PIP_ENABLER_FEED_PIXELBUFFER((CVPixelBufferRef)sourceImage);
     }
     if (gPipOrigCVTextureFromImage != NULL) {
@@ -1594,17 +1703,23 @@ static PipCVPBPoolCreatePixelBufferFn gPipOrigCVPBPoolCreatePixelBuffer = NULL;
 /// 轻量节流：两次喂帧间隔 <8ms 时跳过（多线程下的 benign 竞争可接受）。
 static CFTimeInterval gPipCBFeedLastTime = 0;
 
+// [v6] Rate limit PER SOURCE. The old global limiter let the pool-create path
+// (which returns an empty buffer) win every 8ms window, so the mirror was fed
+// black frames.
 static BOOL PipEnablerCBFeedAllowed(void) {
+    PipFeedSourceStat *st = PipEnablerFeedSourceStat(gPipFeedSourceTag);
+    if (st == NULL) { return NO; }
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now - gPipCBFeedLastTime < 0.008) {
+    if (now - st->lastFeed < 0.008) {
         return NO;
     }
-    gPipCBFeedLastTime = now;
+    st->lastFeed = now;
     return YES;
 }
 
 static void *PipEnablerHookedCVPBGetBaseAddressOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex) {
     if (pixelBuffer != NULL && planeIndex == 0 && PipEnablerCBFeedAllowed()) {
+        gPipFeedSourceTag = "getbase";
         PIP_ENABLER_FEED_PIXELBUFFER(pixelBuffer);
     }
     if (gPipOrigCVPBGetBaseAddressOfPlane != NULL) {
@@ -1619,6 +1734,7 @@ static CVReturn PipEnablerHookedCVPBLockBaseAddress(CVPixelBufferRef pixelBuffer
         ret = gPipOrigCVPBLockBaseAddress(pixelBuffer, flags);
     }
     if (pixelBuffer != NULL && PipEnablerCBFeedAllowed()) {
+        gPipFeedSourceTag = "lockbase";
         PIP_ENABLER_FEED_PIXELBUFFER(pixelBuffer);
     }
     return ret;
@@ -1636,7 +1752,7 @@ static CVReturn PipEnablerHookedCVPBPoolCreatePixelBuffer(CFAllocatorRef allocat
         // 仅当该 buffer 已有有效尺寸时才喂（池刚建出的空 buffer 尺寸已定，但尚无像素；
         // 这里只做类型/非空校验，真实像素由后续 LockBaseAddress/GetBaseAddressOfPlane 覆盖）。
         if (CFGetTypeID(pb) == CVPixelBufferGetTypeID() && PipEnablerCBFeedAllowed()) {
-            PIP_ENABLER_FEED_PIXELBUFFER(pb);
+            // [v6] pool-create path: the buffer was just allocated and is still empty (black) -> never feed it to the mirror pipeline
         }
     }
     return ret;
