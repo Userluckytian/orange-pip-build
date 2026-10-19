@@ -690,6 +690,8 @@ API_AVAILABLE(ios(15.0))
 - (void)installDiagButtons;
 - (void)updateDiagButtonTitles;
 - (void)diagButtonTapped:(UIButton *)sender;
+- (void)setMirrorHostFront:(BOOL)front;
+- (void)logMirrorHostState;
 - (CVPixelBufferRef)renderServerFrameForView:(UIView *)view;
 - (CVPixelBufferRef)boostedCopyOfPixelBuffer:(CVPixelBufferRef)pb;
 - (NSString *)recentDiagText;
@@ -1015,8 +1017,13 @@ API_AVAILABLE(ios(15.0))
                 if (keyWindow == nil) {
                     return;                // 无可挂载窗口，等下一次 refreshDetection 重试
                 }
-                [keyWindow insertSubview:host atIndex:0];   // [v7] behind the app content, invisible on screen
+                // [v10] The mirror layer must be REALLY visible: the PiP system renders the
+                // layer itself, and an occluded or clipped layer yields a black PiP window.
+                // Put the host on top so the layer is genuinely drawn (a small live preview
+                // appears in the corner - that is the point of the A/B test).
+                [keyWindow bringSubviewToFront:host];
                 self.mirrorHostView = host;
+                [self logMirrorHostState];
                 PIP_LOG(@"mirror host view attached to keyWindow");
             PipEnablerDiagLog(@"mirror host view attached to keyWindow, hidden=%d alpha=%.2f frame=%@",
                               (int)host.hidden, host.alpha, NSStringFromCGRect(host.frame));
@@ -1260,7 +1267,15 @@ API_AVAILABLE(ios(15.0))
     if (self.mirrorPTSBase <= 0) { self.mirrorPTSBase = now; }
     CMTime pts = kCMTimeInvalid;
     AVSampleBufferDisplayLayer *tbLayer = self.mirrorLayer;
-    if (self.pipTimebaseMode == 1) {
+    if (self.pipTimebaseMode == 3) {
+        // [v10] no control timebase at all: the layer then uses the sample timestamps
+        // directly and kCMSampleAttachmentKey_DisplayImmediately shows them at once.
+        if (tbLayer != nil && tbLayer.controlTimebase != NULL) {
+            tbLayer.controlTimebase = nil;
+            PipEnablerDiagLog(@"v10: controlTimebase removed");
+        }
+        pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
+    } else if (self.pipTimebaseMode == 1) {
         // [v9] absolute host clock
         pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 600);
     } else if (self.pipTimebaseMode == 2) {
@@ -1422,15 +1437,17 @@ API_AVAILABLE(ios(15.0))
     if (win == nil) { return; }
     PipEnablerLoadPrivateSymbols();
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 74, 236)];
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 74, 300)];
     panel.backgroundColor = [UIColor clearColor];
     panel.userInteractionEnabled = YES;
 
-    NSArray *titles = @[@"源HOOK", @"源快照", @"源渲染", @"提亮", @"时基绝", @"时基齐"];
+    NSArray *titles = @[@"源HOOK", @"源快照", @"源渲染", @"提亮",
+                      @"时基绝", @"时基齐", @"时基无", @"镜像前", @"镜像后"];
     self.diagButtons = [NSMutableArray array];
     for (NSUInteger i = 0; i < titles.count; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
         b.frame = CGRectMake(2, 2 + (CGFloat)i * 30, 70, 27);
+        b.titleLabel.adjustsFontSizeToFitWidth = YES;
         b.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.85];
         b.layer.cornerRadius = 5.0;
         b.titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
@@ -1472,6 +1489,15 @@ API_AVAILABLE(ios(15.0))
     [(UIButton *)self.diagButtons[5] setTitleColor:(boostOn ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
                                                             : [UIColor whiteColor])
                                         forState:UIControlStateNormal];
+    for (NSUInteger i = 0; i < 3; i++) {
+        NSString *t = (i == 0 ? @"时基齐" : (i == 1 ? @"时基绝" : @"时基无"));
+        BOOL on = (self.pipTimebaseMode == (int)i);
+        [(UIButton *)self.diagButtons[4 + i] setTitle:(on ? [@"*" stringByAppendingString:t] : t)
+                                             forState:UIControlStateNormal];
+        [(UIButton *)self.diagButtons[4 + i] setTitleColor:(on ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
+                                                                 : [UIColor whiteColor])
+                                                 forState:UIControlStateNormal];
+    }
 }
 
 - (void)diagButtonTapped:(UIButton *)sender {
@@ -1494,11 +1520,21 @@ API_AVAILABLE(ios(15.0))
             break;
         case 4:
             self.pipTimebaseMode = 1;
-            PipEnablerDiagLog(@"v9: TIMEBASE=absolute (host clock)");
+            PipEnablerDiagLog(@"v10: TIMEBASE=absolute (host clock)");
             break;
         case 5:
             self.pipTimebaseMode = 0;
-            PipEnablerDiagLog(@"v9: TIMEBASE=aligned (control timebase)");
+            PipEnablerDiagLog(@"v10: TIMEBASE=aligned (control timebase)");
+            break;
+        case 6:
+            self.pipTimebaseMode = 3;
+            PipEnablerDiagLog(@"v10: TIMEBASE=none (no controlTimebase, rely on DisplayImmediately)");
+            break;
+        case 7:
+            [self setMirrorHostFront:YES];
+            break;
+        case 8:
+            [self setMirrorHostFront:NO];
             break;
         default:
             break;
@@ -1621,6 +1657,41 @@ API_AVAILABLE(ios(15.0))
     }
     gPipIOSurfaceUnlock(self.renderServerSurface, 0);
     return out;
+}
+
+// [v10] Move the mirror host view in the z-order so the user can A/B the
+// "layer must be really visible" hypothesis without rebuilding.
+- (void)setMirrorHostFront:(BOOL)front {
+    UIView *host = self.mirrorHostView;
+    if (host == nil || host.window == nil) {
+        PipEnablerDiagLog(@"v10: mirror host not attached yet");
+        return;
+    }
+    UIWindow *win = host.window;
+    if (front) {
+        [win bringSubviewToFront:host];
+    } else {
+        [win insertSubview:host atIndex:0];
+    }
+    [self logMirrorHostState];
+}
+
+- (void)logMirrorHostState {
+    UIView *host = self.mirrorHostView;
+    CALayer *layer = self.mirrorLayer;
+    if (host == nil || layer == nil) {
+        PipEnablerDiagLog(@"v10: host state: host=%@ layer=%@",
+                          host ? @"yes" : @"no", layer ? @"yes" : @"no");
+        return;
+    }
+    PipEnablerDiagLog(@"v10: host window=%@ hidden=%d alpha=%.2f superview=%@ frame=%@ | layer superlayer=%@ frame=%@ bounds=%@",
+                      host.window ? @"yes" : @"no",
+                      (int)host.hidden, host.alpha,
+                      host.superview ? NSStringFromClass(host.superview.class) : @"nil",
+                      NSStringFromCGRect(host.frame),
+                      layer.superlayer ? @"yes" : @"no",
+                      NSStringFromCGRect(layer.frame),
+                      NSStringFromCGRect(layer.bounds));
 }
 
 #pragma mark - PiP 启停
