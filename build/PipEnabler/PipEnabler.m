@@ -214,6 +214,56 @@ static double PipEnablerAverageLuma(CVPixelBufferRef pb) {
     return sum / (double)n / 255.0;
 }
 
+#pragma mark - 私有渲染服务（CARenderServerRenderLayer，用于抓 Metal/GL 合成结果）
+
+// 这些符号不公开声明，全部用 dlsym 取得，避免额外的框架依赖。
+typedef void * (*PipIOSurfaceCreateFn)(void *allocator, size_t width, size_t height, void *props);
+typedef int    (*PipIOSurfaceLockFn)(void *surface, int options, void **outPtr);
+typedef int    (*PipIOSurfaceUnlockFn)(void *surface, int options);
+typedef void * (*PipIOSurfaceGetBaseAddressFn)(void *surface);
+typedef size_t (*PipIOSurfaceGetBytesPerRowFn)(void *surface);
+typedef void * (*PipRenderServerCreateFn)(void *allocator, void *surface, CGAffineTransform transform);
+typedef void   (*PipRenderServerDestroyFn)(void *layer);
+
+static PipIOSurfaceCreateFn        gPipIOSurfaceCreate = NULL;
+static PipIOSurfaceLockFn          gPipIOSurfaceLock = NULL;
+static PipIOSurfaceUnlockFn        gPipIOSurfaceUnlock = NULL;
+static PipIOSurfaceGetBaseAddressFn gPipIOSurfaceGetBaseAddress = NULL;
+static PipIOSurfaceGetBytesPerRowFn gPipIOSurfaceGetBytesPerRow = NULL;
+static PipRenderServerCreateFn     gPipRenderServerCreate = NULL;
+static PipRenderServerDestroyFn    gPipRenderServerDestroy = NULL;
+
+static void PipEnablerLoadPrivateSymbols(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gPipIOSurfaceCreate = (PipIOSurfaceCreateFn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        gPipIOSurfaceLock = (PipIOSurfaceLockFn)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        gPipIOSurfaceUnlock = (PipIOSurfaceUnlockFn)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+        gPipIOSurfaceGetBaseAddress = (PipIOSurfaceGetBaseAddressFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        gPipIOSurfaceGetBytesPerRow = (PipIOSurfaceGetBytesPerRowFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+        gPipRenderServerCreate = (PipRenderServerCreateFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderLayerCreate");
+        gPipRenderServerDestroy = (PipRenderServerDestroyFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderLayerDestroy");
+        if (gPipIOSurfaceCreate == NULL || gPipRenderServerCreate == NULL) {
+            // 退一步：从 CoreGraphics / QuartzCore 私有框架里找
+            void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY);
+            void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY);
+            if (gPipIOSurfaceCreate == NULL) {
+                gPipIOSurfaceCreate = (PipIOSurfaceCreateFn)dlsym(cg, "IOSurfaceCreate");
+                gPipIOSurfaceLock = (PipIOSurfaceLockFn)dlsym(cg, "IOSurfaceLock");
+                gPipIOSurfaceUnlock = (PipIOSurfaceUnlockFn)dlsym(cg, "IOSurfaceUnlock");
+                gPipIOSurfaceGetBaseAddress = (PipIOSurfaceGetBaseAddressFn)dlsym(cg, "IOSurfaceGetBaseAddress");
+                gPipIOSurfaceGetBytesPerRow = (PipIOSurfaceGetBytesPerRowFn)dlsym(cg, "IOSurfaceGetBytesPerRow");
+            }
+            if (gPipRenderServerCreate == NULL) {
+                gPipRenderServerCreate = (PipRenderServerCreateFn)dlsym(qc, "CARenderServerRenderLayerCreate");
+                gPipRenderServerDestroy = (PipRenderServerDestroyFn)dlsym(qc, "CARenderServerRenderLayerDestroy");
+            }
+        }
+        PipEnablerDiagLog(@"v9: private symbols surfaceCreate=%p renderServerCreate=%p",
+                          gPipIOSurfaceCreate, gPipRenderServerCreate);
+    });
+}
+
 #pragma mark - 抓帧来源统计（v6：定位黑帧来源）
 
 /// 当前喂帧来源标记，由各个 hook 在喂帧前设置
@@ -607,6 +657,14 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, assign) BOOL        useSnapshot;
 @property (nonatomic, strong) CADisplayLink *snapshotTicker;
 @property (nonatomic, assign) NSUInteger  diagSnapshotSamples;
+// [v9] 可切换的测试策略
+@property (nonatomic, assign) int         pipSourceMode;   // 0=hook 1=snapshot 2=renderServer
+@property (nonatomic, assign) int         pipTimebaseMode; // 0=timebase 1=absolute 2=relative
+@property (nonatomic, assign) BOOL        pipBoost;
+@property (nonatomic, strong) NSMutableArray<UIButton *> *diagButtons;
+@property (nonatomic, strong) UIView *diagPanel;
+@property (nonatomic, assign) void      *renderServerSurface;
+@property (nonatomic, strong) CALayer   *renderServerLayer;
 
 + (instancetype)shared;
 
@@ -629,6 +687,11 @@ API_AVAILABLE(ios(15.0))
 - (UIView *)findViewWithClassPrefix:(NSString *)prefix inView:(UIView *)root;
 - (CVPixelBufferRef)captureViewToPixelBuffer:(UIView *)view;
 - (void)onSnapshotTick:(CADisplayLink *)link;
+- (void)installDiagButtons;
+- (void)updateDiagButtonTitles;
+- (void)diagButtonTapped:(UIButton *)sender;
+- (CVPixelBufferRef)renderServerFrameForView:(UIView *)view;
+- (CVPixelBufferRef)boostedCopyOfPixelBuffer:(CVPixelBufferRef)pb;
 - (NSString *)recentDiagText;
 - (void)showDiagnosticsAlert;
 
@@ -785,6 +848,9 @@ API_AVAILABLE(ios(15.0))
         self.floatingButton = btn;
         [self updateFloatingButtonAppearance];
         PipEnablerDiagLog(@"floating button installed on window=%@", NSStringFromClass(win.class));
+        // [v9] 诊断按钮组（每种策略一个）
+        [self installDiagButtons];
+        self.diagPanel.frame = CGRectMake(win.bounds.size.width - 78, 96, 74, 236);
     };
 
     if (NSThread.isMainThread) {
@@ -1133,8 +1199,10 @@ API_AVAILABLE(ios(15.0))
         (long)(self.mirrorLayer ? self.mirrorLayer.status : -1),
         self.diagLastLuma,
         (unsigned long)self.diagFedFrames, (unsigned long)self.diagEnqueuedFrames];
-    [s appendFormat:@"hookLuma=%.4f snapshotLuma=%.4f useSnapshot=%d\n",
-        self.hookLuma, self.snapshotLuma, (int)self.useSnapshot];
+    [s appendFormat:@"hookLuma=%.4f snapshotLuma=%.4f\n",
+        self.hookLuma, self.snapshotLuma];
+    [s appendFormat:@"mode: source=%d timebase=%d boost=%d\n",
+        self.pipSourceMode, self.pipTimebaseMode, (int)self.pipBoost];
     [s appendString:@"--- capture sources ---\n"];
     [s appendString:PipEnablerFeedSourceSummary()];
     return s;
@@ -1192,19 +1260,36 @@ API_AVAILABLE(ios(15.0))
     if (self.mirrorPTSBase <= 0) { self.mirrorPTSBase = now; }
     CMTime pts = kCMTimeInvalid;
     AVSampleBufferDisplayLayer *tbLayer = self.mirrorLayer;
-    if (tbLayer != nil && tbLayer.controlTimebase != NULL) {
-        pts = CMTimebaseGetTime(tbLayer.controlTimebase);
+    if (self.pipTimebaseMode == 1) {
+        // [v9] absolute host clock
+        pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 600);
+    } else if (self.pipTimebaseMode == 2) {
+        // [v9] relative to the first captured frame
+        pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
+    } else {
+        // [v9] aligned with the layer control timebase (default)
+        if (tbLayer != nil && tbLayer.controlTimebase != NULL) {
+            pts = CMTimebaseGetTime(tbLayer.controlTimebase);
+        }
     }
     if (!CMTIME_IS_NUMERIC(pts)) {
         pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
     }
     self.lastPresentationTime = pts;
 
-    CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(pixelBuffer, pts);
+    CVPixelBufferRef feedBuf = pixelBuffer;
+    CVPixelBufferRef boosted = NULL;
+    if (self.pipBoost) {
+        // [v9] 亮度增益：复制一份并放大亮度
+        boosted = [self boostedCopyOfPixelBuffer:pixelBuffer];
+        if (boosted != NULL) { feedBuf = boosted; }
+    }
+    CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(feedBuf, pts);
     if (sb) {
         [self feedSampleBuffer:sb];
         CFRelease(sb);
     }
+    if (boosted != NULL) { CFRelease(boosted); }
     if (!self.frameCaptureConfirmed) {
         self.frameCaptureConfirmed = YES;
         PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
@@ -1303,21 +1388,239 @@ API_AVAILABLE(ios(15.0))
                               NSStringFromClass(view.class),
                               (size_t)view.bounds.size.width, (size_t)view.bounds.size.height);
         }
-        // [v8] Prefer the on-screen picture whenever it is measurably brighter.
-        if (!self.useSnapshot && self.snapshotLuma > self.hookLuma + 0.05) {
-            self.useSnapshot = YES;
-            PipEnablerDiagLog(@"v8: use SCREENSHOT source (snap=%.3f hook=%.3f)",
-                              self.snapshotLuma, self.hookLuma);
-        } else if (self.useSnapshot && self.snapshotLuma < self.hookLuma - 0.05) {
-            self.useSnapshot = NO;
-            PipEnablerDiagLog(@"v8: back to HOOK source (snap=%.3f hook=%.3f)",
-                              self.snapshotLuma, self.hookLuma);
-        }
     }
-    if (self.useSnapshot) {
+    // [v9] 源模式 1：强制使用 renderInContext 截屏
+    if (self.pipSourceMode == 1) {
         [self enqueuePixelBufferToMirror:pb];
     }
     CFRelease(pb);
+
+    // [v9] 源模式 2：私有渲染服务（对 Metal/GL 合成结果有效）
+    if (self.pipSourceMode == 2) {
+        CVPixelBufferRef rb = [self renderServerFrameForView:view];
+        if (rb != NULL) {
+            double rmn = 0, rmx = 0, ravg = 0;
+            if (PipEnablerLumaStatsBGRA(rb, &rmn, &rmx, &ravg)) {
+                self.snapshotLuma = ravg / 255.0;
+                if (self.diagSnapshotSamples < 3) {
+                    self.diagSnapshotSamples += 1;
+                    PipEnablerDiagLog(@"v9: renderServer luma=%.4f max=%.4f",
+                                      self.snapshotLuma, rmx / 255.0);
+                }
+            }
+            [self enqueuePixelBufferToMirror:rb];
+            CFRelease(rb);
+        }
+    }
+}
+
+// [v9] ---- 诊断按钮组 ------------------------------------------------------
+// 每个按钮切换一种测试策略，点一下即可观察画中画的变化。
+- (void)installDiagButtons {
+    if (self.diagPanel != nil) { return; }
+    UIWindow *win = [self activeKeyWindowForButton];
+    if (win == nil) { return; }
+    PipEnablerLoadPrivateSymbols();
+
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 74, 236)];
+    panel.backgroundColor = [UIColor clearColor];
+    panel.userInteractionEnabled = YES;
+
+    NSArray *titles = @[@"源HOOK", @"源快照", @"源渲染", @"提亮", @"时基绝", @"时基齐"];
+    self.diagButtons = [NSMutableArray array];
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(2, 2 + (CGFloat)i * 30, 70, 27);
+        b.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.85];
+        b.layer.cornerRadius = 5.0;
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
+        [b setTitle:titles[i] forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        b.tag = (NSInteger)i;
+        [b addTarget:self action:@selector(diagButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [panel addSubview:b];
+        [self.diagButtons addObject:b];
+    }
+    [win addSubview:panel];
+    self.diagPanel = panel;
+    [self updateDiagButtonTitles];
+    PipEnablerDiagLog(@"v9: diagnostic panel installed (6 strategy buttons)");
+}
+
+- (void)updateDiagButtonTitles {
+    if (self.diagButtons.count < 6) { return; }
+    NSArray *srcNames = @[@"源HOOK", @"源快照", @"源渲染"];
+    NSArray *tbNames = @[@"时基齐", @"时基绝"];
+    for (NSUInteger i = 0; i < 3; i++) {
+        BOOL on = (self.pipSourceMode == (int)i);
+        [(UIButton *)self.diagButtons[i] setTitle:(on ? [@"*" stringByAppendingString:srcNames[i]] : srcNames[i])
+                                        forState:UIControlStateNormal];
+        [(UIButton *)self.diagButtons[i] setTitleColor:(on ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
+                                                          : [UIColor whiteColor])
+                                            forState:UIControlStateNormal];
+    }
+    for (NSUInteger i = 0; i < 2; i++) {
+        BOOL on = (self.pipTimebaseMode == (int)i);
+        [(UIButton *)self.diagButtons[3 + i] setTitle:(on ? [@"*" stringByAppendingString:tbNames[i]] : tbNames[i])
+                                             forState:UIControlStateNormal];
+        [(UIButton *)self.diagButtons[3 + i] setTitleColor:(on ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
+                                                               : [UIColor whiteColor])
+                                                 forState:UIControlStateNormal];
+    }
+    BOOL boostOn = self.pipBoost;
+    [(UIButton *)self.diagButtons[5] setTitle:(boostOn ? @"*提亮" : @"提亮") forState:UIControlStateNormal];
+    [(UIButton *)self.diagButtons[5] setTitleColor:(boostOn ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
+                                                            : [UIColor whiteColor])
+                                        forState:UIControlStateNormal];
+}
+
+- (void)diagButtonTapped:(UIButton *)sender {
+    switch (sender.tag) {
+        case 0:
+            self.pipSourceMode = 0;
+            PipEnablerDiagLog(@"v9: SOURCE=hook (only hooked frames)");
+            break;
+        case 1:
+            self.pipSourceMode = 1;
+            PipEnablerDiagLog(@"v9: SOURCE=snapshot (renderInContext of the content view)");
+            break;
+        case 2:
+            self.pipSourceMode = 2;
+            PipEnablerDiagLog(@"v9: SOURCE=renderServer (CARenderServerRenderLayer, private)");
+            break;
+        case 3:
+            self.pipBoost = !self.pipBoost;
+            PipEnablerDiagLog(@"v9: BOOST=%@", self.pipBoost ? @"ON (x6 gain on luma)" : @"OFF");
+            break;
+        case 4:
+            self.pipTimebaseMode = 1;
+            PipEnablerDiagLog(@"v9: TIMEBASE=absolute (host clock)");
+            break;
+        case 5:
+            self.pipTimebaseMode = 0;
+            PipEnablerDiagLog(@"v9: TIMEBASE=aligned (control timebase)");
+            break;
+        default:
+            break;
+    }
+    [self updateDiagButtonTitles];
+}
+
+// [v9] 亮度增益：把 Y 平面（420v）或各通道（BGRA）乘以系数，用于验证
+// 「内容是对的、只是太暗」这种可能。
+- (CVPixelBufferRef)boostedCopyOfPixelBuffer:(CVPixelBufferRef)pb {
+    if (pb == NULL) { return NULL; }
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (w == 0 || h == 0) { return NULL; }
+    OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+    CVPixelBufferRef out = NULL;
+    NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
+                             (__bridge CFDictionaryRef)attrs, &out) != kCVReturnSuccess) {
+        return NULL;
+    }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess ||
+        CVPixelBufferLockBaseAddress(out, 0) != kCVReturnSuccess) {
+        CFRelease(out);
+        return NULL;
+    }
+    if (CVPixelBufferGetPlaneCount(pb) > 0 && CVPixelBufferGetPlaneCount(out) > 0) {
+        // 420v: 只放大 Y 平面
+        const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(out, 0);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        size_t ph = CVPixelBufferGetHeightOfPlane(pb, 0);
+        if (src != NULL && dst != NULL) {
+            for (size_t y = 0; y < ph; y++) {
+                const uint8_t *s = src + y * bpr;
+                uint8_t *d = dst + y * bpr;
+                for (size_t x = 0; x < bpr; x++) {
+                    int v = (int)s[x] * 6;
+                    d[x] = (uint8_t)(v > 255 ? 255 : v);
+                }
+            }
+        }
+    } else {
+        const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+        uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(out);
+        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+        if (src != NULL && dst != NULL) {
+            for (size_t y = 0; y < h; y++) {
+                const uint8_t *s = src + y * bpr;
+                uint8_t *d = dst + y * bpr;
+                for (size_t x = 0; x < bpr; x++) {
+                    int v = (int)s[x] * 6;
+                    d[x] = (uint8_t)(v > 255 ? 255 : v);
+                }
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(out, 0);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return out;
+}
+
+// [v9] 用私有渲染服务把「合成后的屏幕内容」取回来（对 Metal/GL 都有效）。
+- (CVPixelBufferRef)renderServerFrameForView:(UIView *)view {
+    PipEnablerLoadPrivateSymbols();
+    if (view == nil || gPipIOSurfaceCreate == NULL || gPipRenderServerCreate == NULL) {
+        return NULL;
+    }
+    size_t w = (size_t)view.bounds.size.width;
+    size_t h = (size_t)view.bounds.size.height;
+    if (w < 32 || h < 32) { return NULL; }
+
+    if (self.renderServerSurface == NULL) {
+        uint32_t pixelFormat = 0x42475241;   // 'BGRA'
+        int props[5] = { 3, 4, (int)pixelFormat, 0, 0 };  // kIOFenceUsage / bytesPerElement
+        void *surf = gPipIOSurfaceCreate(NULL, w, h, props);
+        if (surf == NULL) {
+            PipEnablerDiagLog(@"v9: IOSurfaceCreate failed");
+            return NULL;
+        }
+        void *rl = gPipRenderServerCreate(NULL, surf, CGAffineTransformMakeScale(1, -1));
+        if (rl == NULL) {
+            PipEnablerDiagLog(@"v9: CARenderServerRenderLayerCreate failed");
+            return NULL;
+        }
+        CALayer *layer = (CALayer *)rl;
+        layer.frame = view.bounds;
+        [view.layer addSublayer:layer];
+        self.renderServerSurface = surf;
+        self.renderServerLayer = layer;
+        PipEnablerDiagLog(@"v9: render server layer attached to %@", NSStringFromClass(view.class));
+        return NULL;   // 第一帧还没渲染出来
+    }
+
+    void *base = NULL;
+    if (gPipIOSurfaceLock == NULL || gPipIOSurfaceUnlock == NULL ||
+        gPipIOSurfaceGetBaseAddress == NULL || gPipIOSurfaceGetBytesPerRow == NULL) {
+        return NULL;
+    }
+    if (gPipIOSurfaceLock(self.renderServerSurface, 0, &base) != 0 || base == NULL) {
+        return NULL;
+    }
+    size_t bpr = gPipIOSurfaceGetBytesPerRow(self.renderServerSurface);
+    const uint8_t *src = (const uint8_t *)base;
+    CVPixelBufferRef out = NULL;
+    NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                             (__bridge CFDictionaryRef)attrs, &out) == kCVReturnSuccess) {
+        if (CVPixelBufferLockBaseAddress(out, 0) == kCVReturnSuccess) {
+            uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(out);
+            size_t dstBpr = CVPixelBufferGetBytesPerRow(out);
+            for (size_t y = 0; y < h; y++) {
+                memcpy(dst + y * dstBpr, src + y * bpr, MIN(bpr, dstBpr));
+            }
+            CVPixelBufferUnlockBaseAddress(out, 0);
+        } else {
+            CFRelease(out);
+            out = NULL;
+        }
+    }
+    gPipIOSurfaceUnlock(self.renderServerSurface, 0);
+    return out;
 }
 
 #pragma mark - PiP 启停
@@ -1408,9 +1711,8 @@ API_AVAILABLE(ios(15.0))
         }
     }
 
-    // [v8] When the on-screen source is measurably brighter it is the real picture,
-    // so let it feed the mirror instead of the hooked frames.
-    if (self.useSnapshot) {
+    // [v9] 源模式：0=hook 1=snapshot 2=renderServer
+    if (self.pipSourceMode != 0) {
         return;
     }
     [self enqueuePixelBufferToMirror:pixelBuffer];
