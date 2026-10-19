@@ -621,7 +621,7 @@ API_AVAILABLE(ios(15.0))
     if (v == nil) { return; }
     CGPoint t = [g translationInView:v.superview];
     v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [g setTranslation:CGPointZero inView:v.superview];
+    [g setTranslation:CGPointMake(0, 0) inView:v.superview];
 }
 
 #pragma mark - 探测 / 挂接
