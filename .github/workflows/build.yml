@@ -108,6 +108,8 @@ jobs:
             -framework UIKit \
             -framework CoreMedia \
             -framework CoreVideo \
+            -framework CoreGraphics \
+            -framework QuartzCore \
             build/PipEnabler/PipEnabler.m \
             -o PipEnabler.dylib
           file PipEnabler.dylib
