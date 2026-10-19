@@ -609,7 +609,7 @@ API_AVAILABLE(ios(15.0))
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) { return; }
     PipEnablerDiagLog(@"floating button long-press -> start/stop PiP");
-    if (self.pictureInPictureController.isPictureInPictureActive) {
+    if (self.pipController.isPictureInPictureActive) {
         [self stopPictureInPicture];
     } else {
         [self startPictureInPicture];
