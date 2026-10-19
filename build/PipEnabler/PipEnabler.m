@@ -294,6 +294,40 @@ static NSString *PipEnablerFeedSourceSummary(void) {
     return s;
 }
 
+/// 亮度统计（BGRA 缓冲）：用 G 通道近似亮度。
+static BOOL PipEnablerLumaStatsBGRA(CVPixelBufferRef pb, double *outMin, double *outMax, double *outAvg) {
+    if (pb == NULL) { return NO; }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return NO;
+    }
+    double mn = 255.0, mx = 0.0, sum = 0.0;
+    NSUInteger n = 0;
+    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (base != NULL && w > 0 && h > 0) {
+        size_t stepY = (h / 12 > 0) ? h / 12 : 1;
+        size_t stepX = (w / 12 > 0) ? w / 12 : 1;
+        for (size_t y = 0; y < h; y += stepY) {
+            const uint8_t *row = base + y * bpr;
+            for (size_t x = 0; x < w; x += stepX) {
+                double v = (double)row[x * 4 + 1];   // G channel
+                if (v < mn) { mn = v; }
+                if (v > mx) { mx = v; }
+                sum += v;
+                n++;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (n == 0) { return NO; }
+    if (outMin) { *outMin = mn; }
+    if (outMax) { *outMax = mx; }
+    if (outAvg) { *outAvg = sum / (double)n; }
+    return YES;
+}
+
 #pragma mark - 前向声明
 
 /// 导出的主动喂帧入口（本文件内多个抓帧点都会调用它）
@@ -567,6 +601,12 @@ API_AVAILABLE(ios(15.0))
 // [P4] diagnostics
 @property (nonatomic, assign) NSUInteger diagLumaSamples;
 @property (nonatomic, assign) double      diagLastLuma;
+// [v8] on-screen pixel source (the picture the user actually sees)
+@property (nonatomic, assign) double      hookLuma;
+@property (nonatomic, assign) double      snapshotLuma;
+@property (nonatomic, assign) BOOL        useSnapshot;
+@property (nonatomic, strong) CADisplayLink *snapshotTicker;
+@property (nonatomic, assign) NSUInteger  diagSnapshotSamples;
 
 + (instancetype)shared;
 
@@ -584,6 +624,11 @@ API_AVAILABLE(ios(15.0))
 - (void)teardownPipelineUnsafe;
 - (void)setEnabledTearDownSafely;
 - (void)resizeMirrorLayerToWidth:(int)width height:(int)height;
+- (void)enqueuePixelBufferToMirror:(CVPixelBufferRef)pixelBuffer;
+- (UIView *)snapshotSourceView;
+- (UIView *)findViewWithClassPrefix:(NSString *)prefix inView:(UIView *)root;
+- (CVPixelBufferRef)captureViewToPixelBuffer:(UIView *)view;
+- (void)onSnapshotTick:(CADisplayLink *)link;
 - (NSString *)recentDiagText;
 - (void)showDiagnosticsAlert;
 
@@ -885,6 +930,14 @@ API_AVAILABLE(ios(15.0))
                 // [P4] The PiP window samples this layer, so give it a real size.
                 // The 2x2 host view clips it so nothing shows on screen.
                 self.mirrorLayer.frame = host.bounds;
+                // [v8] start the on-screen pixel source (~10 fps)
+                if (self.snapshotTicker == nil) {
+                    CADisplayLink *sl =
+                        [CADisplayLink displayLinkWithTarget:self selector:@selector(onSnapshotTick:)];
+                    sl.preferredFramesPerSecond = 10;
+                    [sl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+                    self.snapshotTicker = sl;
+                }
                 [host.layer addSublayer:self.mirrorLayer];
                 UIWindow *keyWindow = nil;
                 for (UIWindow *w in UIApplication.sharedApplication.windows) {
@@ -1080,6 +1133,8 @@ API_AVAILABLE(ios(15.0))
         (long)(self.mirrorLayer ? self.mirrorLayer.status : -1),
         self.diagLastLuma,
         (unsigned long)self.diagFedFrames, (unsigned long)self.diagEnqueuedFrames];
+    [s appendFormat:@"hookLuma=%.4f snapshotLuma=%.4f useSnapshot=%d\n",
+        self.hookLuma, self.snapshotLuma, (int)self.useSnapshot];
     [s appendString:@"--- capture sources ---\n"];
     [s appendString:PipEnablerFeedSourceSummary()];
     return s;
@@ -1128,6 +1183,141 @@ API_AVAILABLE(ios(15.0))
     } else {
         PipEnablerDiagLog(@"diagnostics alert: no view controller to present");
     }
+}
+
+// [v8] Shared enqueue path: timestamp on the control timebase and push to the layer.
+- (void)enqueuePixelBufferToMirror:(CVPixelBufferRef)pixelBuffer {
+    if (pixelBuffer == NULL) { return; }
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (self.mirrorPTSBase <= 0) { self.mirrorPTSBase = now; }
+    CMTime pts = kCMTimeInvalid;
+    AVSampleBufferDisplayLayer *tbLayer = self.mirrorLayer;
+    if (tbLayer != nil && tbLayer.controlTimebase != NULL) {
+        pts = CMTimebaseGetTime(tbLayer.controlTimebase);
+    }
+    if (!CMTIME_IS_NUMERIC(pts)) {
+        pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
+    }
+    self.lastPresentationTime = pts;
+
+    CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(pixelBuffer, pts);
+    if (sb) {
+        [self feedSampleBuffer:sb];
+        CFRelease(sb);
+    }
+    if (!self.frameCaptureConfirmed) {
+        self.frameCaptureConfirmed = YES;
+        PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
+    }
+}
+
+// [v8] ---- on-screen pixel source -------------------------------------------------
+// The hooked frames turned out to be nearly black (avg luma ~6%), i.e. they are not the
+// picture the user sees. This source grabs the pixels that are actually on screen and
+// is used whenever it is measurably brighter than the hooked frames.
+
+- (UIView *)findViewWithClassPrefix:(NSString *)prefix inView:(UIView *)root {
+    if (root == nil) { return nil; }
+    NSString *cls = NSStringFromClass(root.class);
+    if ([cls hasPrefix:prefix] && root.bounds.size.width > 100 && root.bounds.size.height > 100) {
+        return root;
+    }
+    for (UIView *sub in root.subviews) {
+        UIView *hit = [self findViewWithClassPrefix:prefix inView:sub];
+        if (hit != nil) { return hit; }
+    }
+    return nil;
+}
+
+- (UIView *)snapshotSourceView {
+    UIWindow *win = [self activeKeyWindowForButton];
+    if (win == nil) { return nil; }
+    UIView *root = win.rootViewController.view;
+    if (root == nil) { return nil; }
+    // Prefer the app native content view (FOKContent...) so the PiP shows the video
+    // rather than the whole UI.
+    UIView *fok = [self findViewWithClassPrefix:@"FOKContent" inView:root];
+    if (fok != nil) { return fok; }
+    return root;
+}
+
+- (CVPixelBufferRef)captureViewToPixelBuffer:(UIView *)view {
+    if (view == nil) { return NULL; }
+    CGSize size = view.bounds.size;
+    if (size.width < 32 || size.height < 32) { return NULL; }
+    @try {
+        UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+        CGContextRef ctx = UIGraphicsGetCurrentContext();
+        if (ctx == NULL) { UIGraphicsEndImageContext(); return NULL; }
+        [view.layer renderInContext:ctx];
+        UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (img == nil) { return NULL; }
+        CGImageRef cg = img.CGImage;
+        if (cg == NULL) { return NULL; }
+        size_t w = CGImageGetWidth(cg);
+        size_t h = CGImageGetHeight(cg);
+        if (w == 0 || h == 0) { return NULL; }
+
+        CVPixelBufferRef pb = NULL;
+        NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+        if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                                 (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
+            return NULL;
+        }
+        if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) {
+            CFRelease(pb);
+            return NULL;
+        }
+        void *base = CVPixelBufferGetBaseAddress(pb);
+        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
+                                  kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        if (bctx != NULL) {
+            CGContextDrawImage(bctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), cg);
+            CGContextRelease(bctx);
+        }
+        CGColorSpaceRelease(cs);
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        return pb;
+    } @catch (NSException *e) {
+        return NULL;
+    }
+}
+
+- (void)onSnapshotTick:(CADisplayLink *)link {
+    if (!self.enabled) { return; }
+    if (self.mirrorLayer == nil) { return; }
+    UIView *view = [self snapshotSourceView];
+    if (view == nil) { return; }
+    CVPixelBufferRef pb = [self captureViewToPixelBuffer:view];
+    if (pb == NULL) { return; }
+    double mn = 0, mx = 0, avg = 0;
+    if (PipEnablerLumaStatsBGRA(pb, &mn, &mx, &avg)) {
+        self.snapshotLuma = avg / 255.0;
+        if (self.diagSnapshotSamples < 3) {
+            self.diagSnapshotSamples += 1;
+            PipEnablerDiagLog(@"v8: snapshot luma=%.4f max=%.4f view=%@ %zux%zu",
+                              self.snapshotLuma, mx / 255.0,
+                              NSStringFromClass(view.class),
+                              (size_t)view.bounds.size.width, (size_t)view.bounds.size.height);
+        }
+        // [v8] Prefer the on-screen picture whenever it is measurably brighter.
+        if (!self.useSnapshot && self.snapshotLuma > self.hookLuma + 0.05) {
+            self.useSnapshot = YES;
+            PipEnablerDiagLog(@"v8: use SCREENSHOT source (snap=%.3f hook=%.3f)",
+                              self.snapshotLuma, self.hookLuma);
+        } else if (self.useSnapshot && self.snapshotLuma < self.hookLuma - 0.05) {
+            self.useSnapshot = NO;
+            PipEnablerDiagLog(@"v8: back to HOOK source (snap=%.3f hook=%.3f)",
+                              self.snapshotLuma, self.hookLuma);
+        }
+    }
+    if (self.useSnapshot) {
+        [self enqueuePixelBufferToMirror:pb];
+    }
+    CFRelease(pb);
 }
 
 #pragma mark - PiP 启停
@@ -1181,52 +1371,23 @@ API_AVAILABLE(ios(15.0))
     if (self.mirrorLayer == nil) {
         [self prepareMirrorPipeline];
     }
-    // ★【黑屏修复】PTS 采用真实到达时间推进（高精度 600 时基），
-    //   替代原先固定 +1/30s 的手工累加——避免抓帧速率≠播放帧率时
-    //   PTS 漂移导致时间轴异常 / 渲染被丢弃。
-    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (self.mirrorPTSBase <= 0) { self.mirrorPTSBase = now; }
-    // [v7] The sample timestamps MUST live on the same timeline as the layer control
-    // timebase. The timebase is zeroed when the pipeline is created, the PTS was zeroed
-    // when the first frame arrived - the origins differ by ~1.7s, so every sample is
-    // permanently in the past for the layer (DisplayImmediately is only honoured for
-    // the first sample) and the layer renders nothing.
-    // Timestamp the samples with the timebase clock itself.
-    CMTime pts = kCMTimeInvalid;
-    AVSampleBufferDisplayLayer *tbLayer = self.mirrorLayer;
-    if (tbLayer != nil && tbLayer.controlTimebase != NULL) {
-        pts = CMTimebaseGetTime(tbLayer.controlTimebase);
-    }
-    if (!CMTIME_IS_NUMERIC(pts)) {
-        pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
-    }
-    self.lastPresentationTime = pts;
 
-    CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(pixelBuffer, pts);
-    if (sb) {
-        [self feedSampleBuffer:sb];
-        CFRelease(sb);
-    }
-    if (!self.frameCaptureConfirmed) {
-        self.frameCaptureConfirmed = YES;
-        PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
-    }
-    // [v6] Black-frame filter. A buffer whose MAXIMUM Y is still at the black level
-    // carries no picture; feeding it is what kept the PiP window black.
+    // [v8] Black-frame filter BEFORE the enqueue. The layer always shows the LAST
+    // enqueued sample, so a black frame must never reach it at all. (In v6/v7 this
+    // check ran after the enqueue, so black frames were still delivered.)
     double mn = 0, mx = 0, avg = 0;
     if (PipEnablerLumaStats(pixelBuffer, &mn, &mx, &avg)) {
-        self.diagLastLuma = avg / 255.0;
+        self.hookLuma = avg / 255.0;
+        self.diagLastLuma = self.hookLuma;
         PipFeedSourceStat *st = PipEnablerFeedSourceStat(gPipFeedSourceTag);
-        // [v7] 16 is the black level of limited-range video; keep dark-but-real frames.
         if (mx < 24.0) {
-            // essentially black -> do not feed
             if (st != NULL) {
                 st->black += 1;
                 st->lastMaxY = mx;
             }
             if (self.diagLumaSamples < 3 || (st != NULL && (st->black % 50) == 0)) {
                 self.diagLumaSamples += 1;
-                PipEnablerDiagLog(@"v6: skip black frame src=%s maxY=%.0f avgY=%.0f (black=%lu)",
+                PipEnablerDiagLog(@"v8: skip black frame src=%s maxY=%.0f avgY=%.0f (black=%lu)",
                                   gPipFeedSourceTag, mx, avg,
                                   (unsigned long)(st ? st->black : 0));
             }
@@ -1239,13 +1400,20 @@ API_AVAILABLE(ios(15.0))
         if (self.diagLumaSamples < 8) {
             self.diagLumaSamples += 1;
             OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
-            PipEnablerDiagLog(@"v6: GOOD frame src=%s minY=%.0f maxY=%.0f avgY=%.0f size=%zux%zu fmt=%c%c%c%c",
+            PipEnablerDiagLog(@"v8: hook GOOD frame src=%s minY=%.0f maxY=%.0f avgY=%.0f size=%zux%zu fmt=%c%c%c%c",
                               gPipFeedSourceTag, mn, mx, avg,
                               CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
                               (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
                               (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF));
         }
     }
+
+    // [v8] When the on-screen source is measurably brighter it is the real picture,
+    // so let it feed the mirror instead of the hooked frames.
+    if (self.useSnapshot) {
+        return;
+    }
+    [self enqueuePixelBufferToMirror:pixelBuffer];
 }
 
 - (void)feedSampleBuffer:(CMSampleBufferRef)sampleBuffer {
