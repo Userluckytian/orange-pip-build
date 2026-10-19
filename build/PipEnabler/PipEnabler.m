@@ -102,6 +102,57 @@ static const CGFloat kPipMirrorHostViewSize = 2.0;
 /// 统一日志前缀
 #define PIP_LOG(fmt, ...) NSLog(@"[PipEnabler] " fmt, ##__VA_ARGS__)
 
+#pragma mark - 持久化诊断日志（真机无日志环境下的可观测性埋点）
+
+/// 诊断日志落到 App 沙盒 Documents/PipEnabler.diag.log。
+/// 目的：真机无法连机取 NSLog 时，仍可导出该文件定位「抓帧是否命中 /
+/// PiP 是否 possible / 是否起播」等关键节点，避免黑屏只能靠猜。
+/// 同一行经 NSNotification(PipEnablerDiagLogNotification) 广播，便于实时订阅。
+static NSString * const kPipEnablerDiagLogNotification = @"PipEnablerDiagLogNotification";
+
+static void PipEnablerDiagLog(NSString *format, ...) {
+    static dispatch_once_t onceToken;
+    static NSDateFormatter *fmt = nil;
+    static NSString *logPath = nil;
+    dispatch_once(&onceToken, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+        NSArray<NSString *> *dirs =
+            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = dirs.count > 0 ? dirs.firstObject : NSTemporaryDirectory();
+        logPath = [docs stringByAppendingPathComponent:@"PipEnabler.diag.log"];
+    });
+
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSString *line = [NSString stringWithFormat:@"%@ [PipEnabler.diag] %@\n",
+                      [fmt stringFromDate:[NSDate date]], msg];
+    NSLog(@"[PipEnabler.diag] %@", msg);
+
+    @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (fh == nil) {
+            [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {
+        // 落盘失败不应影响主流程
+    }
+
+    @try {
+        [NSNotificationCenter.defaultCenter postNotificationName:kPipEnablerDiagLogNotification
+                                                          object:nil
+                                                        userInfo:@{@"line": line}];
+    } @catch (NSException *e) {
+    }
+}
+
 #pragma mark - 前向声明
 
 /// 导出的主动喂帧入口（本文件内多个抓帧点都会调用它）
@@ -339,6 +390,18 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, strong) id                            playbackDelegate;
 @property (nonatomic, assign) CMTime                        lastPresentationTime;
 
+// ★ 新增：界面【可见】手动开关按钮（悬浮）与其宿主窗口
+@property (nonatomic, strong) UIButton *floatingButton;
+@property (nonatomic, weak)   UIWindow *buttonHostWindow;
+// ★ 新增：诊断计数（用于黑屏定位：喂帧/入队/失败重建 次数）
+@property (nonatomic, assign) NSUInteger diagFedFrames;
+@property (nonatomic, assign) NSUInteger diagEnqueuedFrames;
+@property (nonatomic, assign) NSUInteger diagRecoverCount;
+// ★ 新增：帧镜像 PTS 基准（用真实到达时间推进，替代固定 +1/30 漂移）
+@property (nonatomic, assign) CFTimeInterval mirrorPTSBase;
+// ★ 新增：抓帧是否已确认命中（任一抓帧点成功喂帧后置 YES）
+@property (nonatomic, assign) BOOL frameCaptureConfirmed;
+
 + (instancetype)shared;
 
 - (BOOL)isEnabled;
@@ -352,6 +415,12 @@ API_AVAILABLE(ios(15.0))
 - (void)attachToPlayerLayer:(AVPlayerLayer *)playerLayer;
 - (void)prepareMirrorPipeline;
 - (void)teardownPipeline;
+
+// ★ 新增：界面【可见】手动开关按钮
+- (void)installFloatingButton;
+- (void)removeFloatingButton;
+- (void)updateFloatingButtonAppearance;
+- (UIWindow *)activeKeyWindowForButton;
 
 // 帧镜像入口
 - (void)feedPixelBuffer:(CVPixelBufferRef)pixelBuffer;
@@ -414,6 +483,145 @@ API_AVAILABLE(ios(15.0))
 
 - (void)toggle {
     [self setEnabled:!self.enabled];
+}
+
+#pragma mark - 界面【可见】手动开关按钮
+
+/// 取当前可用于挂载悬浮按钮的 keyWindow（兼容多场景）。
+- (UIWindow *)activeKeyWindowForButton {
+    UIWindow *win = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) { continue; }
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            if (ws.activationState != UISceneActivationStateForegroundActive) { continue; }
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) { win = w; break; }
+            }
+            if (win == nil && ws.windows.count > 0) { win = ws.windows.firstObject; }
+            if (win != nil) { break; }
+        }
+    }
+    if (win == nil) {
+        win = UIApplication.sharedApplication.keyWindow;
+    }
+    return win;
+}
+
+/// 安装一个可拖拽的悬浮按钮：点按 = 手动开/关 PiP；长按 = 切换 PiP 起播/停止。
+- (void)installFloatingButton {
+    if (self.floatingButton != nil) {
+        [self updateFloatingButtonAppearance];
+        return;
+    }
+    void (^make)(void) = ^{
+        UIWindow *win = [self activeKeyWindowForButton];
+        if (win == nil) {
+            PipEnablerDiagLog(@"floating button: no keyWindow yet, will retry");
+            return;
+        }
+        self.buttonHostWindow = win;
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = CGRectMake(0, 0, 56, 56);
+        btn.layer.cornerRadius = 28.0;
+        btn.layer.masksToBounds = NO;
+        btn.layer.shadowColor = UIColor.blackColor.CGColor;
+        btn.layer.shadowOpacity = 0.35;
+        btn.layer.shadowRadius = 6.0;
+        btn.layer.shadowOffset = CGSizeMake(0, 2);
+        btn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.85];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        btn.titleLabel.numberOfLines = 2;
+        btn.titleLabel.textAlignment = NSTextAlignmentCenter;
+        btn.accessibilityIdentifier = @"PipEnablerFloatingButton";
+        [btn addTarget:self
+                action:@selector(floatingButtonTapped:)
+      forControlEvents:UIControlEventTouchUpInside];
+        // 长按统一由 UILongPressGestureRecognizer 处理（见下），此处不再绑定 UIControl 事件
+        UILongPressGestureRecognizer *lp =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                          action:@selector(handleLongPress:)];
+        lp.minimumPressDuration = 0.6;
+        [btn addGestureRecognizer:lp];
+        UIPanGestureRecognizer *pan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(handlePan:)];
+        [btn addGestureRecognizer:pan];
+
+        // 初始位置：右上角内侧，避让刘海/状态栏
+        CGRect bounds = win.bounds;
+        CGFloat inset = 12.0;
+        CGFloat topSafe = win.safeAreaInsets.top;
+        btn.center = CGPointMake(bounds.size.width - inset - 28.0,
+                                 topSafe + inset + 28.0);
+
+        [win addSubview:btn];
+        self.floatingButton = btn;
+        [self updateFloatingButtonAppearance];
+        PipEnablerDiagLog(@"floating button installed on window=%@", NSStringFromClass(win.class));
+    };
+
+    if (NSThread.isMainThread) {
+        make();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), make);
+    }
+    // 兜底：keyWindow 尚未就绪时，稍后重试几次
+    if (self.floatingButton == nil) {
+        for (NSUInteger i = 1; i <= 5; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * i * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self.floatingButton == nil) { make(); }
+            });
+        }
+    }
+}
+
+- (void)removeFloatingButton {
+    void (^rm)(void) = ^{
+        [self.floatingButton removeFromSuperview];
+        self.floatingButton = nil;
+    };
+    if (NSThread.isMainThread) { rm(); }
+    else { dispatch_async(dispatch_get_main_queue(), rm); }
+}
+
+- (void)updateFloatingButtonAppearance {
+    void (^up)(void) = ^{
+        UIButton *btn = self.floatingButton;
+        if (btn == nil) { return; }
+        BOOL on = self.enabled;
+        [btn setTitle:(on ? @"PiP 开" : @"PiP 关") forState:UIControlStateNormal];
+        btn.backgroundColor = on
+            ? [UIColor colorWithRed:0.10 green:0.55 blue:0.30 alpha:0.90]
+            : [UIColor colorWithWhite:0.1 alpha:0.85];
+    };
+    if (NSThread.isMainThread) { up(); }
+    else { dispatch_async(dispatch_get_main_queue(), up); }
+}
+
+- (void)floatingButtonTapped:(UIButton *)sender {
+    PipEnablerDiagLog(@"floating button tapped -> toggle PiP enabler");
+    [self toggle];
+}
+
+
+- (void)handleLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) { return; }
+    PipEnablerDiagLog(@"floating button long-press -> start/stop PiP");
+    if (self.pictureInPictureController.isPictureInPictureActive) {
+        [self stopPictureInPicture];
+    } else {
+        [self startPictureInPicture];
+    }
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    if (v == nil) { return; }
+    CGPoint t = [g translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    [g setTranslation:CGPointZero inView:v.superview];
 }
 
 #pragma mark - 探测 / 挂接
@@ -527,6 +735,8 @@ API_AVAILABLE(ios(15.0))
                 [keyWindow bringSubviewToFront:host];
                 self.mirrorHostView = host;
                 PIP_LOG(@"mirror host view attached to keyWindow");
+            PipEnablerDiagLog(@"mirror host view attached to keyWindow, hidden=%d alpha=%.2f frame=%@",
+                              (int)host.hidden, host.alpha, NSStringFromCGRect(host.frame));
             }
         });
     }
@@ -588,6 +798,8 @@ API_AVAILABLE(ios(15.0))
             !self.pipController.isPictureInPictureActive) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 PIP_LOG(@"pictureInPicturePossible=YES -> startPictureInPicture");
+                PipEnablerDiagLog(@"pictureInPicturePossible=YES -> startPictureInPicture; captureConfirmed=%d enqueued=%lu",
+                                  (int)self.frameCaptureConfirmed, (unsigned long)self.diagEnqueuedFrames);
                 [self.pipController startPictureInPicture];
             });
         }
@@ -667,15 +879,22 @@ API_AVAILABLE(ios(15.0))
     if (self.mirrorLayer == nil) {
         [self prepareMirrorPipeline];
     }
-    CMTime pts = self.lastPresentationTime;
-    CMTime step = CMTimeMake(1, 30);
-    pts = CMTimeAdd(pts, step);
+    // ★【黑屏修复】PTS 采用真实到达时间推进（高精度 600 时基），
+    //   替代原先固定 +1/30s 的手工累加——避免抓帧速率≠播放帧率时
+    //   PTS 漂移导致时间轴异常 / 渲染被丢弃。
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (self.mirrorPTSBase <= 0) { self.mirrorPTSBase = now; }
+    CMTime pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
     self.lastPresentationTime = pts;
 
     CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(pixelBuffer, pts);
     if (sb) {
         [self feedSampleBuffer:sb];
         CFRelease(sb);
+    }
+    if (!self.frameCaptureConfirmed) {
+        self.frameCaptureConfirmed = YES;
+        PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed)");
     }
 }
 
@@ -702,11 +921,31 @@ API_AVAILABLE(ios(15.0))
         if (layer == nil) {
             return;
         }
+        // ★【黑屏修复】失败不再只是 flush：重建整条镜像管线，避免长期黑屏。
         if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            PipEnablerDiagLog(@"mirrorLayer.status=Failed -> rebuild mirror pipeline (recover #%lu)",
+                              (unsigned long)(self.diagRecoverCount + 1));
+            self.diagRecoverCount += 1;
             [layer flush];
+            [self teardownPipeline];
+            [self prepareMirrorPipeline];
+            layer = self.mirrorLayer;
+            if (layer == nil) { return; }
+        }
+        // ★【黑屏修复】入队前做背压：层未就绪时丢弃本帧而非硬塞，
+        //   避免样本堆积被判不可渲染 / 时间轴错乱。
+        if ([layer respondsToSelector:@selector(isReadyForMoreMediaData)] &&
+            !layer.isReadyForMoreMediaData) {
+            self.diagFedFrames += 1;
+            return;
         }
         if ([layer respondsToSelector:@selector(enqueueSampleBuffer:)]) {
             [layer enqueueSampleBuffer:sampleBuffer];
+            self.diagFedFrames += 1;
+            self.diagEnqueuedFrames += 1;
+            if (self.diagEnqueuedFrames == 1) {
+                PipEnablerDiagLog(@"first sample buffer enqueued to mirrorLayer");
+            }
         }
         if (layer.controlTimebase != NULL) {
             CMTimebaseSetRate(layer.controlTimebase, 1.0);
@@ -1081,6 +1320,7 @@ static void PipEnablerInstallCVTextureHook(void) {
         }
         if (gPipMSHookFunction == NULL) {
             PIP_LOG(@"[cv-hook] MSHookFunction unavailable -> skip C-function hook (CVOpenGLESTextureCacheCreateTextureFromImage)");
+            PipEnablerDiagLog(@"CRITICAL: MSHookFunction unavailable -> C-function frame capture DISABLED (likely black PiP if no other capture point fires)");
             return;
         }
 
@@ -1309,6 +1549,16 @@ static void PipEnablerInitialize(void) {
 
         __block PipEnablerManager *manager = [PipEnablerManager shared];
         void (^boot)(void) = ^{
+            // ★ 界面【可见】手动开关按钮：随 App 启动即挂载
+            [manager installFloatingButton];
+            [NSNotificationCenter.defaultCenter addObserverForName:PipEnablerEnabledDidChangeNotification
+                                                            object:nil
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification * _Nonnull note) {
+                [manager updateFloatingButtonAppearance];
+            }];
+            PipEnablerDiagLog(@"boot: diag log at sandbox Documents/PipEnabler.diag.log");
+
             // 监听窗口变化，尽快探测内容侧图层
             [NSNotificationCenter.defaultCenter addObserverForName:UIWindowDidBecomeKeyNotification
                                                             object:nil

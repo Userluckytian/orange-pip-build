@@ -49,17 +49,23 @@ def main():
     else:
         changes.append("UIRequiresFullScreen already absent")
 
-    # (2) 追加 UIBackgroundModes=audio（保留原有成员、按序去重）
+    # (2) 追加 UIBackgroundModes=audio + picture-in-picture（保留原有成员、按序去重）
+    #     iOS 16.6.1 上补齐 picture-in-picture，避免 PiP 窗口已起但画面为空的边界情况。
     modes = plist.get("UIBackgroundModes")
     if not isinstance(modes, list):
         modes = []
     modes = [m for m in modes if isinstance(m, str)]
     if "audio" not in modes:
         modes.append("audio")
-        plist["UIBackgroundModes"] = modes
         changes.append("added UIBackgroundModes=audio")
     else:
         changes.append("UIBackgroundModes already contains audio")
+    if "picture-in-picture" not in modes:
+        modes.append("picture-in-picture")
+        changes.append("added UIBackgroundModes=picture-in-picture")
+    else:
+        changes.append("UIBackgroundModes already contains picture-in-picture")
+    plist["UIBackgroundModes"] = modes
 
     # (3) 身份字段自检（保留，不做改写）
     for k in IDENTITY_KEYS:
