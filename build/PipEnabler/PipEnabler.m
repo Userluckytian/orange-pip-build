@@ -184,6 +184,36 @@ static void PipEnablerConfigureAudioSession(void) {
     });
 }
 
+#pragma mark - 亮度探针（判断抓到的帧本身是否全黑）
+
+/// 平均亮度 0..1：区分「抓到的帧本身就是黑的」与「帧有内容但 PiP 显示不出来」。
+static double PipEnablerAverageLuma(CVPixelBufferRef pb) {
+    if (pb == NULL) { return -1.0; }
+    if (CVPixelBufferGetWidth(pb) == 0 || CVPixelBufferGetHeight(pb) == 0) { return -1.0; }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return -1.0;
+    }
+    double sum = 0.0;
+    NSUInteger n = 0;
+    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    if (base != NULL) {
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        size_t pw = CVPixelBufferGetWidthOfPlane(pb, 0);
+        size_t ph = CVPixelBufferGetHeightOfPlane(pb, 0);
+        size_t stepY = (ph / 8 > 0) ? ph / 8 : 1;
+        size_t stepX = (pw / 8 > 0) ? pw / 8 : 1;
+        for (size_t y = 0; y < ph; y += stepY) {
+            for (size_t x = 0; x < pw; x += stepX) {
+                sum += (double)base[y * bpr + x];
+                n++;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (n == 0) { return -1.0; }
+    return sum / (double)n / 255.0;
+}
+
 #pragma mark - 前向声明
 
 /// 导出的主动喂帧入口（本文件内多个抓帧点都会调用它）
@@ -397,7 +427,17 @@ API_AVAILABLE(ios(15.0))
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
               didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
-    // 无需处理：渲染尺寸由系统按 layer 内容自动适配。
+    // [P4] The PiP window renders our sampleBufferDisplayLayer, so the layer must be
+    // resized to the render size the system asks for. A 2x2 layer makes the PiP window
+    // sample a 2x2 surface -> black / garbage.
+    if (newRenderSize.width > 0 && newRenderSize.height > 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.mirrorLayer.frame = CGRectMake(0, 0, newRenderSize.width, newRenderSize.height);
+            [self.mirrorLayer setNeedsLayout];
+        });
+        PipEnablerDiagLog(@"P4: didTransitionToRenderSize %dx%d -> mirror layer resized",
+                          newRenderSize.width, newRenderSize.height);
+    }
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
@@ -438,6 +478,9 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, assign) BOOL frameCaptureConfirmed;
 // [P1 fix C3] reentry guard for teardown/disable flow
 @property (nonatomic, assign) BOOL teardownInProgress;
+// [P4] diagnostics
+@property (nonatomic, assign) NSUInteger diagLumaSamples;
+@property (nonatomic, assign) double      diagLastLuma;
 
 + (instancetype)shared;
 
@@ -692,10 +735,11 @@ API_AVAILABLE(ios(15.0))
         AVPlayerLayer *pl = PipEnablerProbePlayerLayer();
         if (pl) {
             self.detectedPlayerLayer = pl;
-            [self attachToPlayerLayer:pl];          // 路径 A
-        } else {
-            [self prepareMirrorPipeline];           // 路径 B
+            [self attachToPlayerLayer:pl];
         }
+        // [P4] The mirror pipeline is the PiP content source now, so it must ALWAYS run.
+        // It used to be an else-branch, so any detected AVPlayerLayer blocked it.
+        [self prepareMirrorPipeline];
     });
 }
 
@@ -704,37 +748,13 @@ API_AVAILABLE(ios(15.0))
     if (playerLayer == nil) {
         return;
     }
-    if (self.pipController != nil &&
-        [self.pipController.contentSource respondsToSelector:@selector(playerLayer)] &&
-        self.pipController.contentSource.playerLayer == playerLayer) {
-        return; // 已经挂接同一图层
-    }
-    if (!AVPictureInPictureController.isPictureInPictureSupported) {
-        return;
-    }
-
-    AVPictureInPictureController *controller = nil;
-    if (@available(iOS 15.0, *)) {
-        if ([AVPictureInPictureControllerContentSource instancesRespondToSelector:@selector(initWithPlayerLayer:)]) {
-            AVPictureInPictureControllerContentSource *src =
-                [[AVPictureInPictureControllerContentSource alloc] initWithPlayerLayer:playerLayer];
-            controller = [[AVPictureInPictureController alloc] initWithContentSource:src];
-        }
-    }
-    if (controller == nil) {
-        // 旧接口兜底（iOS 15 起已标记 deprecated，但仍存在）
-        if ([AVPictureInPictureController instancesRespondToSelector:@selector(initWithPlayerLayer:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            controller = [[AVPictureInPictureController alloc] initWithPlayerLayer:playerLayer];
-#pragma clang diagnostic pop
-        }
-    }
-    if (controller == nil) {
-        return;
-    }
-    [self configureAutoStartForController:controller];
-    self.pipController = controller;
+    // [P4] The main video is rendered by a self-made ijkplayer-derived engine
+    // (OpenGL ES2 + VideoToolbox); the system AVPlayer in this app belongs to the ad
+    // SDKs (CSJ/GDT/KS). A native PiP on such an AVPlayerLayer shows a BLACK window
+    // while the real video keeps playing in place.
+    // So: do NOT create a native controller here. The mirror pipeline (fed with the
+    // real VideoToolbox frames) is the PiP content source instead.
+    PipEnablerDiagLog(@"P4: AVPlayerLayer detected (likely an ad player) -> native PiP path disabled");
 }
 
 /// 路径 B：帧镜像 —— 自建 AVSampleBufferDisplayLayer + sampleBufferDisplayLayer contentSource
@@ -772,9 +792,11 @@ API_AVAILABLE(ios(15.0))
                 host.opaque = NO;
                 host.alpha = 1.0;          // 必须 >0：alpha=0/hidden 会挂起图层渲染
                 host.hidden = NO;          // 必须非隐藏
-                host.clipsToBounds = NO;
+                host.clipsToBounds = YES;   // [P4] keep the bigger layer invisible on screen
                 host.userInteractionEnabled = NO;
-                self.mirrorLayer.frame = host.bounds;
+                // [P4] The PiP window samples this layer, so give it a real size.
+                // The 2x2 host view clips it so nothing shows on screen.
+                self.mirrorLayer.frame = CGRectMake(0, 0, 640, 360);
                 [host.layer addSublayer:self.mirrorLayer];
                 UIWindow *keyWindow = nil;
                 for (UIWindow *w in UIApplication.sharedApplication.windows) {
@@ -849,6 +871,11 @@ API_AVAILABLE(ios(15.0))
                         change:(NSDictionary<NSKeyValueChangeKey, id> *)change
                        context:(void *)context {
     if ([keyPath isEqualToString:@"pictureInPicturePossible"]) {
+        BOOL possible = (self.pipController != nil) && self.pipController.isPictureInPicturePossible;
+        PipEnablerDiagLog(@"P4: pictureInPicturePossible=%d active=%d enabled=%d controller=%@",
+                          (int)possible,
+                          (int)((self.pipController != nil) && self.pipController.isPictureInPictureActive),
+                          (int)self.enabled, self.pipController ? @"yes" : @"no");
         if (self.enabled && self.pipController != nil &&
             self.pipController.isPictureInPicturePossible &&
             !self.pipController.isPictureInPictureActive) {
@@ -936,6 +963,22 @@ API_AVAILABLE(ios(15.0))
 }
 
 // [P1] Read the tail of the persistent diagnostics log for on-device inspection.
+// [P4] One-shot state summary so a single screenshot tells us everything.
+- (NSString *)stateSummary {
+    AVPictureInPictureController *c = self.pipController;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"enabled=%d controller=%@ possible=%d active=%d\n",
+        (int)self.enabled, c ? @"yes" : @"no",
+        (int)(c ? c.isPictureInPicturePossible : 0),
+        (int)(c ? c.isPictureInPictureActive : 0)];
+    [s appendFormat:@"mirrorLayer=%@ status=%ld lastLuma=%.4f fed=%lu enq=%lu\n",
+        self.mirrorLayer ? @"yes" : @"no",
+        (long)(self.mirrorLayer ? self.mirrorLayer.status : -1),
+        self.diagLastLuma,
+        (unsigned long)self.diagFedFrames, (unsigned long)self.diagEnqueuedFrames];
+    return s;
+}
+
 - (NSString *)recentDiagText {
     NSArray<NSString *> *dirs =
         NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -953,7 +996,7 @@ API_AVAILABLE(ios(15.0))
 
 // [P1] Long-press shows the diagnostics on screen so no tooling is needed on the device.
 - (void)showDiagnosticsAlert {
-    NSString *text = [self recentDiagText];
+    NSString *text = [[self stateSummary] stringByAppendingString:[self recentDiagText]];
     UIAlertController *alert =
         [UIAlertController alertControllerWithTitle:@"PipEnabler 诊断日志"
                                             message:text
@@ -1048,6 +1091,19 @@ API_AVAILABLE(ios(15.0))
     if (!self.frameCaptureConfirmed) {
         self.frameCaptureConfirmed = YES;
         PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
+    }
+    // [P4] luma 恒为 0 说明抓到的是全黑缓冲（抓帧点不对）；
+    //       luma 明显大于 0 说明画面素材是好的（问题在 PiP 通道）。
+    self.diagLastLuma = PipEnablerAverageLuma(pixelBuffer);
+    if (self.diagLumaSamples < 5) {
+        self.diagLumaSamples += 1;
+        OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+        PipEnablerDiagLog(@"P4: frame#%lu luma=%.4f size=%zux%zu fmt=%c%c%c%c iosurface=%d",
+                          (unsigned long)self.diagLumaSamples, self.diagLastLuma,
+                          CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+                          (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
+                          (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF),
+                          (int)(CVPixelBufferGetIOSurface(pixelBuffer) != NULL));
     }
 }
 
