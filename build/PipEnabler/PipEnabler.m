@@ -393,8 +393,17 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
 // initWithSampleBufferDisplayLayer:，必须一并提供 playbackDelegate；
 // 该代理由系统在 PiP 窗口里回调，实现全部 @required 方法即可。
 API_AVAILABLE(ios(15.0))
+// [P4] Forward declaration + a small category so the delegate can resize the
+// manager mirror layer (a bare @class cannot see the property).
+@class PipEnablerManager;
+@interface PipEnablerManager (PipMirrorSupport)
+- (void)resizeMirrorLayerToWidth:(int)width height:(int)height;
+@end
+
 @interface PipSampleBufferPlaybackDelegate : NSObject <AVPictureInPictureSampleBufferPlaybackDelegate>
 @property (nonatomic, assign) BOOL playing;
+// [P4] weak back-reference so the delegate can reach the manager mirror layer
+@property (nonatomic, weak) PipEnablerManager *manager;
 @end
 
 @implementation PipSampleBufferPlaybackDelegate
@@ -431,10 +440,7 @@ API_AVAILABLE(ios(15.0))
     // resized to the render size the system asks for. A 2x2 layer makes the PiP window
     // sample a 2x2 surface -> black / garbage.
     if (newRenderSize.width > 0 && newRenderSize.height > 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.mirrorLayer.frame = CGRectMake(0, 0, newRenderSize.width, newRenderSize.height);
-            [self.mirrorLayer setNeedsLayout];
-        });
+        [self.manager resizeMirrorLayerToWidth:newRenderSize.width height:newRenderSize.height];
         PipEnablerDiagLog(@"P4: didTransitionToRenderSize %dx%d -> mirror layer resized",
                           newRenderSize.width, newRenderSize.height);
     }
@@ -829,7 +835,9 @@ API_AVAILABLE(ios(15.0))
         SEL sbInit = @selector(initWithSampleBufferDisplayLayer:playbackDelegate:);
         if ([AVPictureInPictureControllerContentSource instancesRespondToSelector:sbInit]) {
             if (self.playbackDelegate == nil) {
-                self.playbackDelegate = [[PipSampleBufferPlaybackDelegate alloc] init];
+                PipSampleBufferPlaybackDelegate *delegate = [[PipSampleBufferPlaybackDelegate alloc] init];
+        delegate.manager = self;   // [P4] give the delegate access to the mirror layer
+        self.playbackDelegate = delegate;
             }
             AVPictureInPictureControllerContentSource *src =
                 [[AVPictureInPictureControllerContentSource alloc]
@@ -963,6 +971,17 @@ API_AVAILABLE(ios(15.0))
 }
 
 // [P1] Read the tail of the persistent diagnostics log for on-device inspection.
+// [P4] Resize the mirror layer to the PiP render size the system asks for.
+- (void)resizeMirrorLayerToWidth:(int)width height:(int)height {
+    if (width <= 0 || height <= 0) { return; }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.mirrorLayer != nil) {
+            self.mirrorLayer.frame = CGRectMake(0, 0, width, height);
+            [self.mirrorLayer setNeedsLayout];
+        }
+    });
+}
+
 // [P4] One-shot state summary so a single screenshot tells us everything.
 - (NSString *)stateSummary {
     AVPictureInPictureController *c = self.pipController;
