@@ -162,6 +162,9 @@ static void PipEnablerDiagLog(NSString *format, ...) {
 static void PipEnablerConfigureAudioSession(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        // [P2] Do the work off the caller thread: audio setup must never be able to
+        // abort/crash the enable path that calls this.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @try {
             AVAudioSession *session = AVAudioSession.sharedInstance;
             NSError *err = nil;
@@ -177,6 +180,7 @@ static void PipEnablerConfigureAudioSession(void) {
         } @catch (NSException *e) {
             PipEnablerDiagLog(@"AVAudioSession config exception: %@", e.name);
         }
+        });
     });
 }
 
@@ -499,15 +503,19 @@ API_AVAILABLE(ios(15.0))
 }
 
 - (void)setEnabled:(BOOL)enabled {
+    PipEnablerDiagLog(@"bc setEnabled: enter, target=%d", (int)enabled);
     if (self.enabled == enabled) {
         return;
     }
     self.enabled = enabled;
+    PipEnablerDiagLog(@"bc setEnabled: state updated, persisting");
     [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kPipEnablerEnabledKey];
     [NSUserDefaults.standardUserDefaults synchronize];
 
     if (enabled) {
+        PipEnablerDiagLog(@"bc setEnabled: -> refreshDetection");
         [self refreshDetection];
+        PipEnablerDiagLog(@"bc setEnabled: refreshDetection done");
     } else {
         // [P1 fix C1] The old order was teardownPipeline() then stopPictureInPicture().
         // teardownPipeline() nils pipController, so the subsequent stop became a no-op --
@@ -668,6 +676,9 @@ API_AVAILABLE(ios(15.0))
 }
 
 - (void)refreshDetection {
+    PipEnablerDiagLog(@"bc refreshDetection: enter, mirrorLayer=%@ mirrorHostView=%@",
+                      self.mirrorLayer ? @"yes" : @"no",
+                      self.mirrorHostView ? @"yes" : @"no");
     if (!self.enabled) {
         return;
     }
@@ -725,7 +736,9 @@ API_AVAILABLE(ios(15.0))
 
 /// 路径 B：帧镜像 —— 自建 AVSampleBufferDisplayLayer + sampleBufferDisplayLayer contentSource
 - (void)prepareMirrorPipeline {
-    // [P1 fix F3] PiP requires AVAudioSession playback/moviePlayback
+    PipEnablerDiagLog(@"bc prepareMirrorPipeline: enter");
+    // [P1 fix F3] PiP requires AVAudioSession playback/moviePlayback.
+    // [P2] Scheduled asynchronously -- audio setup is not allowed to jeopardize this path.
     PipEnablerConfigureAudioSession();
     if (self.mirrorLayer == nil) {
         AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
