@@ -1584,7 +1584,7 @@ API_AVAILABLE(ios(15.0))
             PipEnablerDiagLog(@"v9: CARenderServerRenderLayerCreate failed");
             return NULL;
         }
-        CALayer *layer = (CALayer *)rl;
+        CALayer *layer = (__bridge CALayer *)rl;
         layer.frame = view.bounds;
         [view.layer addSublayer:layer];
         self.renderServerSurface = surf;
