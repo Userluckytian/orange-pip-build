@@ -395,9 +395,9 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
 // [P4] Forward declaration + a small category so the delegate can resize the
 // manager mirror layer (a bare @class cannot see the property).
 @class PipEnablerManager;
-@interface PipEnablerManager (PipMirrorSupport)
-- (void)resizeMirrorLayerToWidth:(int)width height:(int)height;
-@end
+// [P4] A plain C function: a category interface would require the full
+// @interface of PipEnablerManager, which is declared further down this file.
+FOUNDATION_EXPORT void PipEnablerResizeMirrorLayer(PipEnablerManager *mgr, int width, int height);
 API_AVAILABLE(ios(15.0))
 
 @interface PipSampleBufferPlaybackDelegate : NSObject <AVPictureInPictureSampleBufferPlaybackDelegate>
@@ -440,7 +440,7 @@ API_AVAILABLE(ios(15.0))
     // resized to the render size the system asks for. A 2x2 layer makes the PiP window
     // sample a 2x2 surface -> black / garbage.
     if (newRenderSize.width > 0 && newRenderSize.height > 0) {
-        [self.manager resizeMirrorLayerToWidth:newRenderSize.width height:newRenderSize.height];
+        PipEnablerResizeMirrorLayer(self.manager, newRenderSize.width, newRenderSize.height);
         PipEnablerDiagLog(@"P4: didTransitionToRenderSize %dx%d -> mirror layer resized",
                           newRenderSize.width, newRenderSize.height);
     }
@@ -503,6 +503,7 @@ API_AVAILABLE(ios(15.0))
 - (void)teardownPipeline;
 - (void)teardownPipelineUnsafe;
 - (void)setEnabledTearDownSafely;
+- (void)resizeMirrorLayerToWidth:(int)width height:(int)height;
 - (NSString *)recentDiagText;
 - (void)showDiagnosticsAlert;
 
@@ -1714,6 +1715,12 @@ static void PipEnablerSwizzledEnqueueSampleBuffer(id self, SEL _cmd, CMSampleBuf
     if ([[PipEnablerManager shared] isEnabled] && sampleBuffer != NULL) {
         [[PipEnablerManager shared] feedSampleBuffer:sampleBuffer];
     }
+}
+
+// [P4] Bridge helper: implemented here so the manager's interface is already visible.
+void PipEnablerResizeMirrorLayer(PipEnablerManager *mgr, int width, int height) {
+    if (mgr == nil) { return; }
+    [mgr resizeMirrorLayerToWidth:width height:height];
 }
 
 static void PipEnablerInstallSwizzles(void) {
