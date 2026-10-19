@@ -144,6 +144,7 @@ jobs:
               -install_name @rpath/PipEnabler.dylib \
               -framework Foundation -framework AVFoundation -framework AVKit \
               -framework UIKit -framework CoreMedia -framework CoreVideo \
+              -framework CoreGraphics -framework QuartzCore \
               "$src" -o "$out"
             file "$out"
             echo "--- LC_BUILD_VERSION / LC_VERSION_MIN_IPHONEOS ($out) ---"

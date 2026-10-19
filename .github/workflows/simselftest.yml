@@ -66,6 +66,7 @@ jobs:
               -install_name @rpath/PipEnabler.dylib \
               -framework Foundation -framework AVFoundation -framework AVKit \
               -framework UIKit -framework CoreMedia -framework CoreVideo \
+              -framework CoreGraphics -framework QuartzCore \
               "$src" -o "$out"
             file "$out"
             otool -L "$out" | head -20 || true
