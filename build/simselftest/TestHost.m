@@ -163,6 +163,17 @@ static CVPixelBufferRef gTestPixelBuffer = NULL;
     R(@"symbols: IsEnabled=%p FeedPixelBuffer=%p StartPiP=%p", fnIsEnabled, fnFeed, fnStart);
     if (fnIsEnabled) { R(@"PipEnablerIsEnabled()=%d", (int)fnIsEnabled()); }
 
+    // ---------- 5.5) 显式开启使能 ----------
+    // P1 起 PIP_ENABLER_DEFAULT_ENABLED=NO（默认关闭，由用户手动点按钮开启），
+    // 自测宿主必须先显式打开，否则 feedPixelBuffer 会被 enabled 门禁拦下，mirrorOK 恒为 0。
+    void (*fnSetEnabled)(BOOL) = _dylibHandle ? (void (*)(BOOL))dlsym(_dylibHandle, "PipEnablerSetEnabled") : NULL;
+    if (fnSetEnabled) {
+        fnSetEnabled(YES);
+        R(@"PipEnablerSetEnabled(YES) 已调用 -> IsEnabled=%d", (int)(fnIsEnabled ? fnIsEnabled() : -1));
+    } else {
+        R(@"!! dlsym(PipEnablerSetEnabled) 失败，无法开启使能");
+    }
+
     // ---------- 6) 触发抓帧/喂帧链路 ----------
     // (a) 走 swizzled -copyPixelBuffer：如果钩子生效，这次调用会自动把 gTestPixelBuffer 喂进镜像层。
     Class cls = testCls;
