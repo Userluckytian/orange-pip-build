@@ -872,9 +872,10 @@ API_AVAILABLE(ios(15.0))
         //   触发的关键缺陷，现已修正为"屏内 2x2、非隐藏、底层"的宿主视图。
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self.mirrorHostView == nil) {
-                UIView *host = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
-                                                                        kPipMirrorHostViewSize,
-                                                                        kPipMirrorHostViewSize)];
+                // [v7] The host view is sized to the mirror layer so the layer is not
+                // clipped away. It is placed BEHIND the app content (index 0), so the
+                // user never sees it, while the system can still render the layer.
+                UIView *host = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 640, 360)];
                 host.backgroundColor = UIColor.clearColor;
                 host.opaque = NO;
                 host.alpha = 1.0;          // 必须 >0：alpha=0/hidden 会挂起图层渲染
@@ -883,7 +884,7 @@ API_AVAILABLE(ios(15.0))
                 host.userInteractionEnabled = NO;
                 // [P4] The PiP window samples this layer, so give it a real size.
                 // The 2x2 host view clips it so nothing shows on screen.
-                self.mirrorLayer.frame = CGRectMake(0, 0, 640, 360);
+                self.mirrorLayer.frame = host.bounds;
                 [host.layer addSublayer:self.mirrorLayer];
                 UIWindow *keyWindow = nil;
                 for (UIWindow *w in UIApplication.sharedApplication.windows) {
@@ -895,8 +896,7 @@ API_AVAILABLE(ios(15.0))
                 if (keyWindow == nil) {
                     return;                // 无可挂载窗口，等下一次 refreshDetection 重试
                 }
-                [keyWindow addSubview:host];       // 置于屏内(0,0) 2x2，肉眼不可见但参与渲染
-                [keyWindow bringSubviewToFront:host];
+                [keyWindow insertSubview:host atIndex:0];   // [v7] behind the app content, invisible on screen
                 self.mirrorHostView = host;
                 PIP_LOG(@"mirror host view attached to keyWindow");
             PipEnablerDiagLog(@"mirror host view attached to keyWindow, hidden=%d alpha=%.2f frame=%@",
@@ -1056,6 +1056,10 @@ API_AVAILABLE(ios(15.0))
 - (void)resizeMirrorLayerToWidth:(int)width height:(int)height {
     if (width <= 0 || height <= 0) { return; }
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.mirrorHostView != nil) {
+            // [v7] keep the host and the layer the same size (no clipping)
+            self.mirrorHostView.frame = CGRectMake(0, 0, width, height);
+        }
         if (self.mirrorLayer != nil) {
             self.mirrorLayer.frame = CGRectMake(0, 0, width, height);
             [self.mirrorLayer setNeedsLayout];
@@ -1182,7 +1186,20 @@ API_AVAILABLE(ios(15.0))
     //   PTS 漂移导致时间轴异常 / 渲染被丢弃。
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
     if (self.mirrorPTSBase <= 0) { self.mirrorPTSBase = now; }
-    CMTime pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
+    // [v7] The sample timestamps MUST live on the same timeline as the layer control
+    // timebase. The timebase is zeroed when the pipeline is created, the PTS was zeroed
+    // when the first frame arrived - the origins differ by ~1.7s, so every sample is
+    // permanently in the past for the layer (DisplayImmediately is only honoured for
+    // the first sample) and the layer renders nothing.
+    // Timestamp the samples with the timebase clock itself.
+    CMTime pts = kCMTimeInvalid;
+    AVSampleBufferDisplayLayer *tbLayer = self.mirrorLayer;
+    if (tbLayer != nil && tbLayer.controlTimebase != NULL) {
+        pts = CMTimebaseGetTime(tbLayer.controlTimebase);
+    }
+    if (!CMTIME_IS_NUMERIC(pts)) {
+        pts = CMTimeMakeWithSeconds(now - self.mirrorPTSBase, 600);
+    }
     self.lastPresentationTime = pts;
 
     CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(pixelBuffer, pts);
@@ -1200,7 +1217,8 @@ API_AVAILABLE(ios(15.0))
     if (PipEnablerLumaStats(pixelBuffer, &mn, &mx, &avg)) {
         self.diagLastLuma = avg / 255.0;
         PipFeedSourceStat *st = PipEnablerFeedSourceStat(gPipFeedSourceTag);
-        if (mx < 40.0) {
+        // [v7] 16 is the black level of limited-range video; keep dark-but-real frames.
+        if (mx < 24.0) {
             // essentially black -> do not feed
             if (st != NULL) {
                 st->black += 1;
@@ -1279,9 +1297,8 @@ API_AVAILABLE(ios(15.0))
                 PipEnablerDiagLog(@"first sample buffer enqueued to mirrorLayer");
             }
         }
-        if (layer.controlTimebase != NULL) {
-            CMTimebaseSetRate(layer.controlTimebase, 1.0);
-        }
+        // [v7] the timebase rate is set once when it is created; resetting it on
+        // every frame causes scheduling hiccups on the layer.
         if (!self.pipActive && self.pipController != nil) {
             // 帧已开始流入，尝试自动拉起 PiP；若此刻仍不可用，KVO 会在
             // pictureInPicturePossible 变 YES 后补一次起播。
