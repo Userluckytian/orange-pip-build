@@ -67,6 +67,16 @@ def main():
         changes.append("UIBackgroundModes already contains picture-in-picture")
     plist["UIBackgroundModes"] = modes
 
+    # (3) [P1] 开启文件共享：诊断日志写入 Documents/PipEnabler.diag.log，
+    #     开启后可直接在 iOS「文件」App 中查看/分享，实现零工具取证。
+    for key, val in (("UIFileSharingEnabled", True),
+                     ("LSSupportsOpeningDocumentsInPlace", True)):
+        if plist.get(key) != val:
+            plist[key] = val
+            changes.append("set %s=%s" % (key, val))
+        else:
+            changes.append("%s already set" % key)
+
     # (3) 身份字段自检（保留，不做改写）
     for k in IDENTITY_KEYS:
         if k not in plist:

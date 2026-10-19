@@ -94,7 +94,8 @@ static NSString * const kPipEnablerEnabledKey = @"PipEnablerEnabled";
 
 /// 缺省使能状态：未显式写入 NSUserDefaults 时默认开启，
 /// 否则注入 dylib 后帧镜像管线不会启动，画中画对真实视频依旧不可用。
-static const BOOL PIP_ENABLER_DEFAULT_ENABLED = YES;
+// [P1] Default OFF: user asked for a manual on/off button, no auto-PiP.
+static const BOOL PIP_ENABLER_DEFAULT_ENABLED = NO;
 
 /// 镜像渲染用的小宿主视图尺寸（PiP 层需真正可见，挂到窗口上有助于部分 iOS 版本正确驱动渲染）
 static const CGFloat kPipMirrorHostViewSize = 2.0;
@@ -151,6 +152,32 @@ static void PipEnablerDiagLog(NSString *format, ...) {
                                                         userInfo:@{@"line": line}];
     } @catch (NSException *e) {
     }
+}
+
+#pragma mark - 音频会话（PiP 前置条件）
+
+// Configure AVAudioSession as .playback + .moviePlayback.
+// Community implementations (PiPBugDemo) mark this as "required to support Picture in Picture".
+// The previous implementation never configured an audio session at all.
+static void PipEnablerConfigureAudioSession(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        @try {
+            AVAudioSession *session = AVAudioSession.sharedInstance;
+            NSError *err = nil;
+            if (![session setCategory:AVAudioSessionCategoryPlayback
+                            mode:AVAudioSessionModeMoviePlayback
+                         options:0
+                           error:&err]) {
+                PipEnablerDiagLog(@"AVAudioSession setCategory failed: %@", err.localizedDescription);
+            } else {
+                [session setActive:YES error:NULL];
+                PipEnablerDiagLog(@"AVAudioSession configured: playback/moviePlayback");
+            }
+        } @catch (NSException *e) {
+            PipEnablerDiagLog(@"AVAudioSession config exception: %@", e.name);
+        }
+    });
 }
 
 #pragma mark - 前向声明
@@ -356,9 +383,12 @@ API_AVAILABLE(ios(15.0))
 }
 
 - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)pictureInPictureController {
-    // 帧镜像无固定时长，返回一个以当前时间起、足够长的区间。
-    CMTime start = CMTimeMake((int64_t)(CFAbsoluteTimeGetCurrent() * 1000.0), 1000);
-    return CMTimeRangeMake(start, CMTimeMake(3600, 1));
+    // [P1 fix F1: black screen root cause]
+    // Old code used CFAbsoluteTimeGetCurrent() (seconds since boot, 1e5-1e6 scale) as start,
+    // while the enqueued sample PTS starts near 0 -- a 5-6 order-of-magnitude mismatch.
+    // AVKit places the playhead at TimeRange.start where no frame exists => black PiP window.
+    // Frame-mirroring case: return the infinite range (StackOverflow 69799535).
+    return CMTimeRangeMake(kCMTimeNegativeInfinity, kCMTimePositiveInfinity);
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
@@ -378,7 +408,8 @@ API_AVAILABLE(ios(15.0))
 
 #pragma mark - PiP 管理器
 
-@interface PipEnablerManager : NSObject
+// [P1 fix C1] conform so controller.delegate = self type-checks cleanly
+@interface PipEnablerManager : NSObject <AVPictureInPictureControllerDelegate>
 
 @property (nonatomic, assign) BOOL enabled;          // 使能开关
 @property (nonatomic, assign) BOOL pipActive;        // 当前是否处于 PiP 中
@@ -401,6 +432,8 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, assign) CFTimeInterval mirrorPTSBase;
 // ★ 新增：抓帧是否已确认命中（任一抓帧点成功喂帧后置 YES）
 @property (nonatomic, assign) BOOL frameCaptureConfirmed;
+// [P1 fix C3] reentry guard for teardown/disable flow
+@property (nonatomic, assign) BOOL teardownInProgress;
 
 + (instancetype)shared;
 
@@ -415,6 +448,10 @@ API_AVAILABLE(ios(15.0))
 - (void)attachToPlayerLayer:(AVPlayerLayer *)playerLayer;
 - (void)prepareMirrorPipeline;
 - (void)teardownPipeline;
+- (void)teardownPipelineUnsafe;
+- (void)setEnabledTearDownSafely;
+- (NSString *)recentDiagText;
+- (void)showDiagnosticsAlert;
 
 // ★ 新增：界面【可见】手动开关按钮
 - (void)installFloatingButton;
@@ -472,8 +509,11 @@ API_AVAILABLE(ios(15.0))
     if (enabled) {
         [self refreshDetection];
     } else {
-        [self teardownPipeline];
-        [self stopPictureInPicture];
+        // [P1 fix C1] The old order was teardownPipeline() then stopPictureInPicture().
+        // teardownPipeline() nils pipController, so the subsequent stop became a no-op --
+        // the PiP content source was destroyed while PiP was still rendering.
+        // That matches "tap the button => crash". Now: stop first, tear down after it stops.
+        [self setEnabledTearDownSafely];
     }
 
     [NSNotificationCenter.defaultCenter postNotificationName:PipEnablerEnabledDidChangeNotification
@@ -608,12 +648,9 @@ API_AVAILABLE(ios(15.0))
 
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) { return; }
-    PipEnablerDiagLog(@"floating button long-press -> start/stop PiP");
-    if (self.pipController.isPictureInPictureActive) {
-        [self stopPictureInPicture];
-    } else {
-        [self startPictureInPicture];
-    }
+    // [P1] Long-press now shows diagnostics (screenshot-able), not start/stop.
+    PipEnablerDiagLog(@"floating button long-press -> show diagnostics");
+    [self showDiagnosticsAlert];
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)g {
@@ -688,6 +725,8 @@ API_AVAILABLE(ios(15.0))
 
 /// 路径 B：帧镜像 —— 自建 AVSampleBufferDisplayLayer + sampleBufferDisplayLayer contentSource
 - (void)prepareMirrorPipeline {
+    // [P1 fix F3] PiP requires AVAudioSession playback/moviePlayback
+    PipEnablerConfigureAudioSession();
     if (self.mirrorLayer == nil) {
         AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
         layer.videoGravity = AVLayerVideoGravityResizeAspect;
@@ -761,6 +800,7 @@ API_AVAILABLE(ios(15.0))
             AVPictureInPictureController *controller =
                 [[AVPictureInPictureController alloc] initWithContentSource:src];
             [self configureAutoStartForController:controller];
+            controller.delegate = self;   // [P1 fix C1] need didStop callback to finish teardown
             self.pipController = controller;
             PIP_LOG(@"mirror PiP controller created (sampleBufferDisplayLayer content source)");
         }
@@ -808,7 +848,20 @@ API_AVAILABLE(ios(15.0))
     [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
 }
 
+// [P1 fix C2] teardownPipeline touches UIKit (removeFromSuperview / removeObserver) and is
+// reachable from the frame-capture thread (Failed self-heal). Always marshal to main.
 - (void)teardownPipeline {
+    if (NSThread.isMainThread) {
+        [self teardownPipelineUnsafe];
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self teardownPipelineUnsafe];
+        });
+    }
+}
+
+- (void)teardownPipelineUnsafe {
+    PipEnablerDiagLog(@"breadcrumb: teardownPipelineUnsafe enter");
     if (self.pipController != nil) {
         @try {
             [self.pipController removeObserver:self forKeyPath:@"pictureInPicturePossible"];
@@ -825,6 +878,90 @@ API_AVAILABLE(ios(15.0))
     if (self.mirrorHostView) {
         [self.mirrorHostView removeFromSuperview];
         self.mirrorHostView = nil;
+    }
+}
+
+// [P1 fix C1] Stop PiP first, then tear the pipeline down once PiP has actually stopped.
+- (void)setEnabledTearDownSafely {
+    if (self.teardownInProgress) {
+        return;
+    }
+    self.teardownInProgress = YES;
+    PipEnablerDiagLog(@"breadcrumb: setEnabledTearDownSafely enter, pipActive=%d ctrl=%@",
+                      (int)self.pipActive, self.pipController ? @"yes" : @"no");
+
+    AVPictureInPictureController *ctrl = self.pipController;
+    if (self.pipActive && ctrl != nil) {
+        [self stopPictureInPicture];
+        PipEnablerDiagLog(@"C1 fix: stopPictureInPicture issued, teardown deferred until stopped");
+        // Fallback in case didStop never arrives.
+        __weak PipEnablerManager *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            PipEnablerManager *s = weakSelf;
+            if (s == nil) { return; }
+            if (s.teardownInProgress) {
+                s.teardownInProgress = NO;
+                [s teardownPipeline];
+            }
+        });
+        return;
+    }
+
+    self.teardownInProgress = NO;
+    [self teardownPipeline];
+}
+
+// [P1 fix C1] PiP fully stopped -> safe to destroy the content source now.
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    PipEnablerDiagLog(@"didStopPictureInPicture -> teardown pipeline");
+    self.teardownInProgress = NO;
+    [self teardownPipeline];
+}
+
+// [P1] Read the tail of the persistent diagnostics log for on-device inspection.
+- (NSString *)recentDiagText {
+    NSArray<NSString *> *dirs =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docs = dirs.count > 0 ? dirs.firstObject : NSTemporaryDirectory();
+    NSString *p = [docs stringByAppendingPathComponent:@"PipEnabler.diag.log"];
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (d.length == 0) {
+        return @"(no diagnostics yet)";
+    }
+    NSUInteger want = MIN(d.length, (NSUInteger)1800);
+    NSString *s = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(d.length - want, want)]
+                                         encoding:NSUTF8StringEncoding];
+    return s ?: @"(decode failed)";
+}
+
+// [P1] Long-press shows the diagnostics on screen so no tooling is needed on the device.
+- (void)showDiagnosticsAlert {
+    NSString *text = [self recentDiagText];
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"PipEnabler 诊断日志"
+                                            message:text
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"复制"
+                                            style:UIAlertActionStyleDefault
+                                          handler:^(UIAlertAction *a) {
+        UIPasteboard.generalPasteboard.string = text;
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
+                                            style:UIAlertActionStyleCancel
+                                          handler:nil]];
+    UIViewController *top = nil;
+    UIWindow *win = [self activeKeyWindowForButton];
+    if (win.rootViewController != nil) {
+        top = win.rootViewController;
+        while (top.presentedViewController != nil) {
+            top = top.presentedViewController;
+        }
+    }
+    if (top != nil) {
+        [top presentViewController:alert animated:YES completion:nil];
+    } else {
+        PipEnablerDiagLog(@"diagnostics alert: no view controller to present");
     }
 }
 
@@ -894,7 +1031,7 @@ API_AVAILABLE(ios(15.0))
     }
     if (!self.frameCaptureConfirmed) {
         self.frameCaptureConfirmed = YES;
-        PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed)");
+        PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
     }
 }
 
