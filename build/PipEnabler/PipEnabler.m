@@ -392,13 +392,13 @@ static AVPlayerLayer *PipEnablerProbePlayerLayer(void) {
 // 说明：AVPictureInPictureControllerContentSource 没有单参数
 // initWithSampleBufferDisplayLayer:，必须一并提供 playbackDelegate；
 // 该代理由系统在 PiP 窗口里回调，实现全部 @required 方法即可。
-API_AVAILABLE(ios(15.0))
 // [P4] Forward declaration + a small category so the delegate can resize the
 // manager mirror layer (a bare @class cannot see the property).
 @class PipEnablerManager;
 @interface PipEnablerManager (PipMirrorSupport)
 - (void)resizeMirrorLayerToWidth:(int)width height:(int)height;
 @end
+API_AVAILABLE(ios(15.0))
 
 @interface PipSampleBufferPlaybackDelegate : NSObject <AVPictureInPictureSampleBufferPlaybackDelegate>
 @property (nonatomic, assign) BOOL playing;
