@@ -275,6 +275,22 @@ static CVPixelBufferRef gTestPixelBuffer = NULL;
         R(@"pipController=nil（模拟器 isPictureInPictureSupported=NO 时 dylib 按设计不创建 controller）");
     }
 
+    // [v13] 快速开关压力：10 次同步 setEnabled 翻转，验证代计数/销毁逻辑不崩。
+    // （模拟器上 controller 不创建，主要压 layer/host 的销毁-重建路径；
+    //   若崩溃则走不到 SELFTEST_RESULT，CI 自然判 FAIL。）
+    {
+        void (*fnSE)(BOOL) = _dylibHandle ? (void (*)(BOOL))dlsym(_dylibHandle, "PipEnablerSetEnabled") : NULL;
+        if (fnSE != NULL) {
+            R(@"v13 stress: 10x rapid setEnabled toggles begin");
+            for (int i = 0; i < 10; i++) {
+                fnSE((i % 2) == 0 ? NO : YES);
+            }
+            R(@"v13 stress: 10x toggles done, still alive");
+        } else {
+            R(@"v13 stress: skip (dlsym PipEnablerSetEnabled failed)");
+        }
+    }
+
     // ---------- 判定 ----------
     BOOL pass = (_dylibHandle != NULL)
               && (_mgrClass != Nil)

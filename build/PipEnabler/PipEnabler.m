@@ -697,6 +697,16 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, assign) NSUInteger pipRetryChecks;   // [v12] 重试检查次数（模拟器自测断言用）
 @property (nonatomic, assign) BOOL        pipPeakPossible; // [v12] possible 是否到过 YES
 @property (nonatomic, strong) UIButton   *playerPiPButton; // [v12] 播放器控制栏内 PiP 图标
+
+@property (nonatomic, assign) NSUInteger teardownGeneration; // [v13] 销毁代计数：重新开启取消挂起销毁
+@property (nonatomic, assign) NSUInteger pipWillStartCount;  // [v13] PiP 事件监听：willStart
+@property (nonatomic, assign) NSUInteger pipDidStartCount;   // [v13] didStart（窗口真正出现）
+@property (nonatomic, assign) NSUInteger pipFailedStartCount;// [v13] failedToStart（含错误）
+@property (nonatomic, assign) NSUInteger pipDidStopCount;    // [v13] didStop
+@property (nonatomic, copy)   NSString *lastPiPError;        // [v13] 最近一次起播失败原因
+@property (nonatomic, assign) BOOL       pipFeedStartTried;  // [v13] 首帧一次性起播（替代 pipActive 谎报）
+@property (nonatomic, assign) BOOL       selfTestRunning;    // [v13] 应用内自测运行中
+@property (nonatomic, assign) double     lastHierarchyDumpAt;// [v13] 控制栏层级 dump 节流
 @property (nonatomic, strong) NSMutableArray<UIButton *> *diagButtons;
 @property (nonatomic, strong) UIView *diagPanel;
 @property (nonatomic, assign) void      *renderServerSurface;
@@ -732,6 +742,11 @@ API_AVAILABLE(ios(15.0))
 - (void)installPlayerPiPButton;     // [v12] 播放器控制栏注入 PiP 图标
 - (void)attachMirrorHostToWindow;   // [v12] 宿主挂载 A/B
 - (void)detachMirrorHostFromWindow; // [v12] 宿主卸载 A/B
+- (void)runInAppSelfTest;                                   // [v13] 应用内一键自测
+- (void)finishSelfTestStress;                               // [v13] 自测压力段
+- (void)deferredTeardownCheckWithGeneration:(NSUInteger)gen; // [v13] 代计数销毁检查
+- (void)dumpPlayerControlHierarchy;                         // [v13] 控制栏候选视图 dump
+- (NSString *)fullDiagTextForCopy;                          // [v13] 复制用完整日志
 - (NSString *)recentDiagText;
 - (void)showDiagnosticsAlert;
 
@@ -789,12 +804,15 @@ API_AVAILABLE(ios(15.0))
         return;
     }
     _enabled = enabled;
-    PipEnablerDiagLog(@"bc setEnabled: state updated, persisting");
+    self.teardownGeneration += 1;   // [v13] 每次开关变化都推进销毁代
+    PipEnablerDiagLog(@"bc setEnabled: state updated (gen=%lu), persisting",
+                      (unsigned long)self.teardownGeneration);
     [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kPipEnablerEnabledKey];
     [NSUserDefaults.standardUserDefaults synchronize];
 
     if (enabled) {
-        PipEnablerDiagLog(@"bc setEnabled: -> refreshDetection");
+        self.teardownInProgress = NO;   // [v13] 重新开启 = 取消一切挂起的延迟销毁
+        PipEnablerDiagLog(@"bc setEnabled: -> refreshDetection (pending teardown cancelled)");
         [self refreshDetection];
         PipEnablerDiagLog(@"bc setEnabled: refreshDetection done");
     } else {
@@ -888,12 +906,8 @@ API_AVAILABLE(ios(15.0))
         self.floatingButton = btn;
         [self updateFloatingButtonAppearance];
         PipEnablerDiagLog(@"floating button installed on window=%@", NSStringFromClass(win.class));
-        // [v9] 诊断按钮组（每种策略一个）
-        [self installDiagButtons];
-        // [v12] 面板 2 倍大、屏幕居中（调试期）
-        CGFloat pipPw = 292.0, pipPh = 352.0;
-        self.diagPanel.frame = CGRectMake((win.bounds.size.width - pipPw) / 2.0,
-                                         (win.bounds.size.height - pipPh) / 2.0, pipPw, pipPh);
+        // [v13] 按用户要求只保留一个按钮：悬浮球（点按=自测，长按=日志）。
+        // 12 按钮调试面板不再安装；A/B 与压力测试全部由自测脚本自动完成。
     };
 
     if (NSThread.isMainThread) {
@@ -925,10 +939,10 @@ API_AVAILABLE(ios(15.0))
     void (^up)(void) = ^{
         UIButton *btn = self.floatingButton;
         if (btn == nil) { return; }
-        BOOL on = self.enabled;
-        [btn setTitle:(on ? @"PiP 开" : @"PiP 关") forState:UIControlStateNormal];
-        btn.backgroundColor = on
-            ? [UIColor colorWithRed:0.10 green:0.55 blue:0.30 alpha:0.90]
+        // [v13] 悬浮球改为「自测」：点按跑脚本，长按看日志。
+        [btn setTitle:(self.selfTestRunning ? @"自测中…" : @"自测") forState:UIControlStateNormal];
+        btn.backgroundColor = self.selfTestRunning
+            ? [UIColor colorWithRed:0.85 green:0.55 blue:0.10 alpha:0.92]
             : [UIColor colorWithWhite:0.1 alpha:0.85];
     };
     if (NSThread.isMainThread) { up(); }
@@ -936,8 +950,8 @@ API_AVAILABLE(ios(15.0))
 }
 
 - (void)floatingButtonTapped:(UIButton *)sender {
-    PipEnablerDiagLog(@"floating button tapped -> toggle PiP enabler");
-    [self toggle];
+    PipEnablerDiagLog(@"floating button tapped -> run in-app self-test");
+    [self runInAppSelfTest];
 }
 
 
@@ -1010,6 +1024,13 @@ API_AVAILABLE(ios(15.0))
 
 /// 路径 B：帧镜像 —— 自建 AVSampleBufferDisplayLayer + sampleBufferDisplayLayer contentSource
 - (void)prepareMirrorPipeline {
+    // [v13] 线程安全：解码线程兜底也会走到这里。管线对象（layer/controller/KVO）
+    // 必须只在主线程创建/销毁，否则与主线程销毁竞态 ->
+    // "deallocated while key value observers were registered" 崩溃。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareMirrorPipeline]; });
+        return;
+    }
     PipEnablerDiagLog(@"bc prepareMirrorPipeline: enter");
     // [P1 fix F3] PiP requires AVAudioSession playback/moviePlayback.
     // [P2] Scheduled asynchronously -- audio setup is not allowed to jeopardize this path.
@@ -1058,22 +1079,11 @@ API_AVAILABLE(ios(15.0))
                     self.snapshotTicker = sl;
                 }
                 [host.layer addSublayer:self.mirrorLayer];
-                UIWindow *keyWindow = nil;
-                for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                    if (w.isKeyWindow) { keyWindow = w; break; }
-                }
-                if (keyWindow == nil) {
-                    keyWindow = UIApplication.sharedApplication.windows.firstObject;
-                }
-                if (keyWindow == nil) {
-                    return;                // 无可挂载窗口，等下一次 refreshDetection 重试
-                }
-                // [v10] The mirror layer must be REALLY visible: the PiP system renders the
-                // layer itself, and an occluded or clipped layer yields a black PiP window.
-                // Put the host on top so the layer is genuinely drawn (a small live preview
-                // appears in the corner - that is the point of the A/B test).
-                [keyWindow bringSubviewToFront:host];
                 self.mirrorHostView = host;
+                // [v13] 真正挂载：v10 把 insertSubview:atIndex:0 误改成 bringSubviewToFront:
+                // （对非子视图是空操作），宿主从未进过窗口。现在统一走 attachMirrorHostToWindow
+                // （addSubview + bringSubviewToFront）。挂载/卸载 A/B 由自测脚本自动完成。
+                [self attachMirrorHostToWindow];
                 [self logMirrorHostState];
                 PIP_LOG(@"mirror host view attached to keyWindow");
             PipEnablerDiagLog(@"mirror host view attached to keyWindow, hidden=%d alpha=%.2f frame=%@",
@@ -1164,7 +1174,8 @@ API_AVAILABLE(ios(15.0))
     if (NSThread.isMainThread) {
         [self teardownPipelineUnsafe];
     } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
+        // [v13] sync->async：绝不同步阻塞解码线程；销毁最终在主线程串行执行。
+        dispatch_async(dispatch_get_main_queue(), ^{
             [self teardownPipelineUnsafe];
         });
     }
@@ -1180,6 +1191,7 @@ API_AVAILABLE(ios(15.0))
     }
     self.pipController = nil;
     self.playbackDelegate = nil;
+    self.pipFeedStartTried = NO;   // [v13] 新管线重新做首帧起播尝试
     if (self.mirrorLayer) {
         [self.mirrorLayer flushAndRemoveImage];
         [self.mirrorLayer removeFromSuperlayer];
@@ -1204,16 +1216,13 @@ API_AVAILABLE(ios(15.0))
     if (self.pipActive && ctrl != nil) {
         [self stopPictureInPicture];
         PipEnablerDiagLog(@"C1 fix: stopPictureInPicture issued, teardown deferred until stopped");
-        // Fallback in case didStop never arrives.
+        // [v13] 代计数兜底：只有「期间没再开关过 && 仍禁用 && PiP 已真正停止」才销毁。
+        // v12 的无条件兜底会在用户快速重开后销毁刚重建的管线（enabled=1 但管线全毁）。
+        NSUInteger gen = self.teardownGeneration;
         __weak PipEnablerManager *weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            PipEnablerManager *s = weakSelf;
-            if (s == nil) { return; }
-            if (s.teardownInProgress) {
-                s.teardownInProgress = NO;
-                [s teardownPipeline];
-            }
+            [weakSelf deferredTeardownCheckWithGeneration:gen];
         });
         return;
     }
@@ -1223,9 +1232,60 @@ API_AVAILABLE(ios(15.0))
 }
 
 // [P1 fix C1] PiP fully stopped -> safe to destroy the content source now.
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    self.pipWillStartCount += 1;
+    PipEnablerDiagLog(@"[PiP] WILL START (willStart=%lu)", (unsigned long)self.pipWillStartCount);
+}
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    self.pipDidStartCount += 1;
+    self.pipActive = YES;
+    PipEnablerDiagLog(@"[PiP] DID START — 画中画窗口已出现 (didStart=%lu)", (unsigned long)self.pipDidStartCount);
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+    failedToStartPictureInPictureWithError:(NSError *)error {
+    self.pipFailedStartCount += 1;
+    self.pipActive = NO;
+    self.lastPiPError = [NSString stringWithFormat:@"%@/%ld: %@",
+                          error.domain, (long)error.code, error.localizedDescription];
+    PipEnablerDiagLog(@"[PiP] FAILED TO START (failed=%lu): domain=%@ code=%ld desc=%@",
+                      (unsigned long)self.pipFailedStartCount, error.domain,
+                      (long)error.code, error.localizedDescription);
+}
+
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
-    PipEnablerDiagLog(@"didStopPictureInPicture -> teardown pipeline");
+    self.pipDidStopCount += 1;
+    self.pipActive = NO;
+    PipEnablerDiagLog(@"[PiP] DID STOP (didStop=%lu)", (unsigned long)self.pipDidStopCount);
     self.teardownInProgress = NO;
+    if (!self.enabled) {
+        [self teardownPipeline];
+    } else {
+        PipEnablerDiagLog(@"[PiP] didStop 但 enabled=YES -> 保留管线，重试定时器会自动再起");
+    }
+}
+
+// [v13] 延迟销毁检查：可被重新开启取消；PiP 未停则续期，绝不在渲染中销毁图层。
+- (void)deferredTeardownCheckWithGeneration:(NSUInteger)gen {
+    if (!self.teardownInProgress) { return; }   // 已被 setEnabled(YES) 取消
+    if (gen != self.teardownGeneration || self.enabled) {
+        PipEnablerDiagLog(@"v13: deferred teardown cancelled (gen=%lu cur=%lu enabled=%d)",
+                          (unsigned long)gen, (unsigned long)self.teardownGeneration, (int)self.enabled);
+        self.teardownInProgress = NO;
+        return;
+    }
+    if (self.pipController != nil && self.pipController.isPictureInPictureActive) {
+        PipEnablerDiagLog(@"v13: PiP 仍活动中，销毁再延 0.8s");
+        __weak PipEnablerManager *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf deferredTeardownCheckWithGeneration:gen];
+        });
+        return;
+    }
+    self.teardownInProgress = NO;
+    PipEnablerDiagLog(@"v13: deferred teardown executing (gen=%lu)", (unsigned long)gen);
     [self teardownPipeline];
 }
 
@@ -1264,6 +1324,14 @@ API_AVAILABLE(ios(15.0))
         self.pipSourceMode, self.pipTimebaseMode, (int)self.pipBoost,
         self.pipChromaMode, self.lastUVAvg, (int)self.pipPeakPossible,
         (unsigned long)self.pipStartAttempts];
+    [s appendFormat:@"pipEvents: willStart=%lu didStart=%lu failed=%lu didStop=%lu lastErr=%@\n",
+        (unsigned long)self.pipWillStartCount, (unsigned long)self.pipDidStartCount,
+        (unsigned long)self.pipFailedStartCount, (unsigned long)self.pipDidStopCount,
+        self.lastPiPError ?: @"(none)"];
+    [s appendFormat:@"hostAttached=%d feedStartTried=%d gen=%lu selfTest=%d\n",
+        (int)(self.mirrorHostView != nil && self.mirrorHostView.window != nil),
+        (int)self.pipFeedStartTried, (unsigned long)self.teardownGeneration,
+        (int)self.selfTestRunning];
     [s appendString:@"--- capture sources ---\n"];
     [s appendString:PipEnablerFeedSourceSummary()];
     return s;
@@ -1278,7 +1346,21 @@ API_AVAILABLE(ios(15.0))
     if (d.length == 0) {
         return @"(no diagnostics yet)";
     }
-    NSUInteger want = MIN(d.length, (NSUInteger)1800);
+    NSUInteger want = MIN(d.length, (NSUInteger)6000);   // [v13] 容纳自测脚本全程输出
+    NSString *s = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(d.length - want, want)]
+                                         encoding:NSUTF8StringEncoding];
+    return s ?: @"(decode failed)";
+}
+
+// [v13] 复制按钮用：取日志文件最后 32KB（自测全程 + PiP 事件流都在里面）。
+- (NSString *)fullDiagTextForCopy {
+    NSArray<NSString *> *dirs =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docs = dirs.count > 0 ? dirs.firstObject : NSTemporaryDirectory();
+    NSString *p = [docs stringByAppendingPathComponent:@"PipEnabler.diag.log"];
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (d.length == 0) { return @"(no diagnostics yet)"; }
+    NSUInteger want = MIN(d.length, (NSUInteger)32768);
     NSString *s = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(d.length - want, want)]
                                          encoding:NSUTF8StringEncoding];
     return s ?: @"(decode failed)";
@@ -1291,10 +1373,12 @@ API_AVAILABLE(ios(15.0))
         [UIAlertController alertControllerWithTitle:@"PipEnabler 诊断日志"
                                             message:text
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"复制"
+    [alert addAction:[UIAlertAction actionWithTitle:@"复制日志(32K)"
                                             style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *a) {
-        UIPasteboard.generalPasteboard.string = text;
+        UIPasteboard.generalPasteboard.string =
+            [[[self stateSummary] stringByAppendingString:@"\n"]
+                stringByAppendingString:[self fullDiagTextForCopy]];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
                                             style:UIAlertActionStyleCancel
@@ -1869,11 +1953,19 @@ API_AVAILABLE(ios(15.0))
 // 用户要求的 UX：播放视频时控制栏出现画中画图标，点按对当前视频开/关 PiP。
 // 控制栏类名来自静态逆向（BU_ZFPlayerControlView / ZFPlayerControlView）。
 - (void)installPlayerPiPButton {
-    if (self.playerPiPButton != nil && self.playerPiPButton.superview != nil) {
+    if (self.playerPiPButton != nil && self.playerPiPButton.window != nil) {
         return;  // 已在位
     }
+    if (self.playerPiPButton != nil) {
+        // [v13] 控制栏被播放器重建：旧按钮已脱离窗口，移除后重注入。
+        [self.playerPiPButton removeFromSuperview];
+        self.playerPiPButton = nil;
+    }
     UIView *ctrl = [self findPlayerControlView];
-    if (ctrl == nil) { return; }
+    if (ctrl == nil) {
+        [self dumpPlayerControlHierarchy];   // [v13] 找不到时 dump 候选视图类名
+        return;
+    }
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     UIImage *img = [UIImage systemImageNamed:@"pip.fill"];
     if (img == nil) { img = [UIImage systemImageNamed:@"rectangle.on.rectangle"]; }
@@ -1885,7 +1977,9 @@ API_AVAILABLE(ios(15.0))
         [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
     }
-    b.frame = CGRectMake(ctrl.bounds.size.width - 56.0, ctrl.bounds.size.height - 132.0, 44.0, 44.0);
+    // [v13] 位置钳制：矮控制栏（height<48）时 y 会被钳到 4，不再出现负坐标被裁剪。
+    b.frame = CGRectMake(MAX(8.0, ctrl.bounds.size.width - 52.0),
+                         MAX(4.0, ctrl.bounds.size.height - 48.0), 44.0, 44.0);
     b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
     b.layer.cornerRadius = 8.0;
@@ -1909,7 +2003,8 @@ API_AVAILABLE(ios(15.0))
     NSString *cls = NSStringFromClass(root.class);
     for (NSString *n in names) {
         if ([cls containsString:n] &&
-            root.bounds.size.width >= minSize && root.bounds.size.height >= minSize * 0.4) {
+            // [v13] 高度阈值 80->30：ZFPlayer 控制栏可能是矮条形（如 390x50）。
+            root.bounds.size.width >= 200.0 && root.bounds.size.height >= 30.0) {
             return root;
         }
     }
@@ -1923,6 +2018,115 @@ API_AVAILABLE(ios(15.0))
 - (void)playerPiPButtonTapped:(UIButton *)sender {
     PipEnablerDiagLog(@"v12: player PiP button tapped -> toggle");
     [self toggle];
+}
+
+#pragma mark - [v13] 应用内一键自测
+
+// 用户点悬浮球触发：自动完成 挂载/卸载 A/B + 起播监听 + 快速开关压力测试。
+// 全部结果写入 PipEnabler.diag.log（长按悬浮球查看/复制）。
+- (void)dumpPlayerControlHierarchy {
+    double now = CACurrentMediaTime();
+    if (now - self.lastHierarchyDumpAt < 10.0) { return; }   // 节流：10s 一次
+    self.lastHierarchyDumpAt = now;
+    UIWindow *win = [self activeKeyWindowForButton];
+    if (win == nil) { return; }
+    NSMutableString *dump = [NSMutableString string];
+    __block NSUInteger count = 0;
+    void (^walk)(UIView *, NSInteger) = nil;
+    walk = ^(UIView *v, NSInteger depth) {
+        if (count >= 25 || v == nil) { return; }
+        if (v.bounds.size.width >= 150.0) {
+            [dump appendFormat:@"  d%ld %@ %@\n", (long)depth,
+                NSStringFromClass(v.class), NSStringFromCGRect(v.frame)];
+            count += 1;
+        }
+        for (UIView *sub in v.subviews) { walk(sub, depth + 1); }
+    };
+    walk(win, 0);
+    PipEnablerDiagLog(@"v13: control-view candidates (width>=150, top 25):\n%@", dump);
+}
+
+- (void)runInAppSelfTest {
+    if (self.selfTestRunning) {
+        PipEnablerDiagLog(@"[SELFTEST] 已在运行中，忽略本次点按");
+        return;
+    }
+    self.selfTestRunning = YES;
+    [self updateFloatingButtonAppearance];
+    PipEnablerDiagLog(@"[SELFTEST] ===== BEGIN v13 应用内自测（约15秒）=====");
+    PipEnablerDiagLog(@"[SELFTEST] step0 初始状态:\n%@", [self stateSummary]);
+    [self dumpPlayerControlHierarchy];
+
+    __weak PipEnablerManager *weakSelf = self;
+    if (self.enabled) {
+        PipEnablerDiagLog(@"[SELFTEST] stepA0: setEnabled(NO) 干净起点");
+        [self setEnabled:NO];
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PipEnablerManager *s = weakSelf;
+        if (s == nil) { return; }
+        PipEnablerDiagLog(@"[SELFTEST] stepA1 (+1.2s): setEnabled(YES)，宿主=挂载模式");
+        [s setEnabled:YES];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PipEnablerManager *s = weakSelf;
+        if (s == nil) { return; }
+        PipEnablerDiagLog(@"[SELFTEST] stepA2 (+6.5s) 挂载模式状态:\n%@", [s stateSummary]);
+        BOOL startedA = (s.pipDidStartCount > 0) ||
+                        (s.pipController != nil && s.pipController.isPictureInPictureActive);
+        PipEnablerDiagLog(@"[SELFTEST] stepA 结论: PiP已启动=%d (didStart=%lu failed=%lu)",
+                          (int)startedA, (unsigned long)s.pipDidStartCount,
+                          (unsigned long)s.pipFailedStartCount);
+        if (!startedA) {
+            PipEnablerDiagLog(@"[SELFTEST] stepB0: 切换宿主=卸载模式（v10 唯一出过内容的配置）");
+            [s detachMirrorHostFromWindow];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                PipEnablerManager *s2 = weakSelf;
+                if (s2 == nil) { return; }
+                PipEnablerDiagLog(@"[SELFTEST] stepB2 卸载模式状态:\n%@", [s2 stateSummary]);
+                BOOL startedB = (s2.pipDidStartCount > 0) ||
+                                (s2.pipController != nil && s2.pipController.isPictureInPictureActive);
+                PipEnablerDiagLog(@"[SELFTEST] stepB 结论: PiP已启动=%d", (int)startedB);
+                [s2 finishSelfTestStress];
+            });
+        } else {
+            [s finishSelfTestStress];
+        }
+    });
+}
+
+- (void)finishSelfTestStress {
+    PipEnablerDiagLog(@"[SELFTEST] stepC: 快速开关压力测试 x10（0.1s 间隔，验证竞态修复）");
+    __weak PipEnablerManager *weakSelf = self;
+    for (NSUInteger i = 0; i < 10; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * (int64_t)i * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            PipEnablerManager *s = weakSelf;
+            if (s == nil) { return; }
+            [s toggle];
+        });
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PipEnablerManager *s = weakSelf;
+        if (s == nil) { return; }
+        if (!s.enabled) {
+            PipEnablerDiagLog(@"[SELFTEST] stepD0: 恢复 setEnabled(YES)");
+            [s setEnabled:YES];
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            PipEnablerManager *s2 = weakSelf;
+            if (s2 == nil) { return; }
+            PipEnablerDiagLog(@"[SELFTEST] stepD 最终状态:\n%@", [s2 stateSummary]);
+            PipEnablerDiagLog(@"[SELFTEST] ===== END 自测完成，应用未崩溃 =====");
+            s2.selfTestRunning = NO;
+            [s2 updateFloatingButtonAppearance];
+        });
+    });
 }
 
 #pragma mark - PiP 启停
@@ -2050,14 +2254,16 @@ API_AVAILABLE(ios(15.0))
         }
         // ★【黑屏修复】失败不再只是 flush：重建整条镜像管线，避免长期黑屏。
         if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-            PipEnablerDiagLog(@"mirrorLayer.status=Failed -> rebuild mirror pipeline (recover #%lu)",
-                              (unsigned long)(self.diagRecoverCount + 1));
+            // [v13] 不在解码线程上同步 teardown+rebuild（与主线程销毁竞态）。
+            // 改为主线程异步重建，本帧丢弃。
             self.diagRecoverCount += 1;
-            [layer flush];
-            [self teardownPipeline];
-            [self prepareMirrorPipeline];
-            layer = self.mirrorLayer;
-            if (layer == nil) { return; }
+            PipEnablerDiagLog(@"mirrorLayer.status=Failed -> async rebuild #%lu (frame dropped)",
+                              (unsigned long)self.diagRecoverCount);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self teardownPipeline];
+                [self prepareMirrorPipeline];
+            });
+            return;
         }
         // ★【黑屏修复】入队前做背压：层未就绪时丢弃本帧而非硬塞，
         //   避免样本堆积被判不可渲染 / 时间轴错乱。
@@ -2076,10 +2282,11 @@ API_AVAILABLE(ios(15.0))
         }
         // [v7] the timebase rate is set once when it is created; resetting it on
         // every frame causes scheduling hiccups on the layer.
-        if (!self.pipActive && self.pipController != nil) {
-            // 帧已开始流入，尝试自动拉起 PiP；若此刻仍不可用，KVO 会在
-            // pictureInPicturePossible 变 YES 后补一次起播。
-            self.pipActive = YES;
+        if (!self.pipFeedStartTried && self.pipController != nil) {
+            // [v13] 一次性起播尝试。v12 这里误把 pipActive 置 YES（且从不清零），
+            // 导致「PiP 从未启动也走延迟销毁路径」。pipActive 现在只由系统回调维护。
+            self.pipFeedStartTried = YES;
+            PipEnablerDiagLog(@"[PiP] first frame -> one-shot start attempt");
             if (!self.pipController.isPictureInPictureActive) {
                 if ([NSThread isMainThread]) {
                     [self.pipController startPictureInPicture];
