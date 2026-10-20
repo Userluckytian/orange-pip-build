@@ -1081,14 +1081,15 @@ API_AVAILABLE(ios(15.0))
                 [host.layer addSublayer:self.mirrorLayer];
                 self.mirrorHostView = host;
                 // [v13.1] 默认不挂载（保持 v10/v11/v12 行为）：
-                //  - v13 曾在 prepare 里 addSubview，iOS 模拟器主线程随即挂死
-                //    （2s 定时器/3.5s 判定全部未执行，无崩溃报告），CI 稳定复现；
                 //  - v10 真机证据：不挂载是唯一显示过内容的配置；
                 //  - 挂载/卸载 A/B 由自测脚本按「先安全后冒险」顺序自动完成。
                 //    （宿主不在窗口里时 AVSampleBufferDisplayLayer 仍可被 PiP 内容源直接渲染）
+                //  - [v13.2 勘误] v13 当时"挂载导致模拟器挂死"的归因是错的：
+                //    真凶是 dumpPlayerControlHierarchy 的递归 block 缺 __block（见该方法注释），
+                //    v13 与 v13.1 都带着这个 bug，与是否挂载无关。
                 [self logMirrorHostState];
-                PIP_LOG(@"mirror host view attached to keyWindow");
-            PipEnablerDiagLog(@"mirror host view attached to keyWindow, hidden=%d alpha=%.2f frame=%@",
+                PIP_LOG(@"mirror host ready (NOT attached to window; attach A/B via self-test)");
+            PipEnablerDiagLog(@"mirror host ready (not attached), hidden=%d alpha=%.2f frame=%@",
                               (int)host.hidden, host.alpha, NSStringFromCGRect(host.frame));
             }
         });
@@ -2034,7 +2035,12 @@ API_AVAILABLE(ios(15.0))
     if (win == nil) { return; }
     NSMutableString *dump = [NSMutableString string];
     __block NSUInteger count = 0;
-    void (^walk)(UIView *, NSInteger) = nil;
+    // [v13.2] 递归 block 必须 __block：按值捕获会在 block 字面量创建时固化当时的值(nil)，
+    // 首个带子视图的递归调用 walk(sub, ...) 即空 block 调用 -> SIGSEGV。
+    // 这正是 v13/v13.1 模拟器自测失败的根因：2s 定时器首次触发 ->
+    // installPlayerPiPButton -> TestHost 无 ZFPlayerControlView -> ctrl==nil ->
+    // dumpPlayerControlHierarchy -> 首次递归即崩，进程死于 boot+2s，报告未写出。
+    __block void (^walk)(UIView *, NSInteger);
     walk = ^(UIView *v, NSInteger depth) {
         if (count >= 25 || v == nil) { return; }
         if (v.bounds.size.width >= 150.0) {
