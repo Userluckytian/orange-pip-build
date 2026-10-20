@@ -332,6 +332,36 @@ static BOOL PipEnablerLumaStats(CVPixelBufferRef pb, double *outMin, double *out
     return YES;
 }
 
+/// [v11] 色度统计：双平面 YUV 的 UV 平面平均值。
+/// 解读：≈0 → 源帧色度全零（hook 点只有 Y）；≈128 → 中性；明显偏离 → 真实色度。
+static BOOL PipEnablerChromaStats(CVPixelBufferRef pb, double *outAvg) {
+    if (pb == NULL) { return NO; }
+    if (CVPixelBufferGetPlaneCount(pb) < 2) { return NO; }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return NO;
+    }
+    double sum = 0.0;
+    NSUInteger n = 0;
+    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (base != NULL) {
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        size_t pw = CVPixelBufferGetWidthOfPlane(pb, 1);
+        size_t ph = CVPixelBufferGetHeightOfPlane(pb, 1);
+        size_t stepY = (ph / 8 > 0) ? ph / 8 : 1;
+        size_t stepX = (pw / 8 > 0) ? pw / 8 : 1;
+        for (size_t y = 0; y < ph; y += stepY) {
+            for (size_t x = 0; x < pw; x += stepX) {
+                sum += (double)base[y * bpr + x];
+                n++;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (n == 0) { return NO; }
+    if (outAvg) { *outAvg = sum / (double)n; }
+    return YES;
+}
+
 /// 各来源统计摘要（给诊断浮层用）
 static NSString *PipEnablerFeedSourceSummary(void) {
     NSMutableString *s = [NSMutableString string];
@@ -661,6 +691,8 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, assign) int         pipSourceMode;   // 0=hook 1=snapshot 2=renderServer
 @property (nonatomic, assign) int         pipTimebaseMode; // 0=timebase 1=absolute 2=relative
 @property (nonatomic, assign) BOOL        pipBoost;
+@property (nonatomic, assign) int         pipChromaMode;  // [v11] 0=直通(拷源UV) 1=灰度(U=V=128) 2=转BGRA
+@property (nonatomic, assign) double      lastUVAvg;      // [v11] 源帧 UV 平面平均值
 @property (nonatomic, strong) NSMutableArray<UIButton *> *diagButtons;
 @property (nonatomic, strong) UIView *diagPanel;
 @property (nonatomic, assign) void      *renderServerSurface;
@@ -693,7 +725,7 @@ API_AVAILABLE(ios(15.0))
 - (void)setMirrorHostFront:(BOOL)front;
 - (void)logMirrorHostState;
 - (CVPixelBufferRef)renderServerFrameForView:(UIView *)view;
-- (CVPixelBufferRef)boostedCopyOfPixelBuffer:(CVPixelBufferRef)pb;
+- (CVPixelBufferRef)processedCopyOfPixelBuffer:(CVPixelBufferRef)pb;
 - (NSString *)recentDiagText;
 - (void)showDiagnosticsAlert;
 
@@ -1208,8 +1240,9 @@ API_AVAILABLE(ios(15.0))
         (unsigned long)self.diagFedFrames, (unsigned long)self.diagEnqueuedFrames];
     [s appendFormat:@"hookLuma=%.4f snapshotLuma=%.4f\n",
         self.hookLuma, self.snapshotLuma];
-    [s appendFormat:@"mode: source=%d timebase=%d boost=%d\n",
-        self.pipSourceMode, self.pipTimebaseMode, (int)self.pipBoost];
+    [s appendFormat:@"mode: source=%d timebase=%d boost=%d chroma=%d uvAvg=%.1f\n",
+        self.pipSourceMode, self.pipTimebaseMode, (int)self.pipBoost,
+        self.pipChromaMode, self.lastUVAvg];
     [s appendString:@"--- capture sources ---\n"];
     [s appendString:PipEnablerFeedSourceSummary()];
     return s;
@@ -1293,18 +1326,19 @@ API_AVAILABLE(ios(15.0))
     self.lastPresentationTime = pts;
 
     CVPixelBufferRef feedBuf = pixelBuffer;
-    CVPixelBufferRef boosted = NULL;
-    if (self.pipBoost) {
-        // [v9] 亮度增益：复制一份并放大亮度
-        boosted = [self boostedCopyOfPixelBuffer:pixelBuffer];
-        if (boosted != NULL) { feedBuf = boosted; }
+    CVPixelBufferRef processed = NULL;
+    if (self.pipChromaMode != 0 || self.pipBoost) {
+        // [v11] 统一处理管线：亮度增益 + 色度模式。
+        // 修复 v9/v10 绿屏根因：旧 boostedCopy 只拷 Y 平面，UV 全零 → 纯绿。
+        processed = [self processedCopyOfPixelBuffer:pixelBuffer];
+        if (processed != NULL) { feedBuf = processed; }
     }
     CMSampleBufferRef sb = PipEnablerCreateSampleBuffer(feedBuf, pts);
     if (sb) {
         [self feedSampleBuffer:sb];
         CFRelease(sb);
     }
-    if (boosted != NULL) { CFRelease(boosted); }
+    if (processed != NULL) { CFRelease(processed); }
     if (!self.frameCaptureConfirmed) {
         self.frameCaptureConfirmed = YES;
         PipEnablerDiagLog(@"frame capture CONFIRMED (first pixel buffer fed) -- H1 disproved");
@@ -1437,12 +1471,13 @@ API_AVAILABLE(ios(15.0))
     if (win == nil) { return; }
     PipEnablerLoadPrivateSymbols();
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 74, 300)];
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 74, 368)];
     panel.backgroundColor = [UIColor clearColor];
     panel.userInteractionEnabled = YES;
 
     NSArray *titles = @[@"源HOOK", @"源快照", @"源渲染", @"提亮",
-                      @"时基绝", @"时基齐", @"时基无", @"镜像前", @"镜像后"];
+                      @"时基绝", @"时基齐", @"时基无", @"镜像前", @"镜像后",
+                      @"色度直", @"色度灰", @"色度B"];
     self.diagButtons = [NSMutableArray array];
     for (NSUInteger i = 0; i < titles.count; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -1461,42 +1496,51 @@ API_AVAILABLE(ios(15.0))
     [win addSubview:panel];
     self.diagPanel = panel;
     [self updateDiagButtonTitles];
-    PipEnablerDiagLog(@"v9: diagnostic panel installed (6 strategy buttons)");
+    PipEnablerDiagLog(@"v11: diagnostic panel installed (12 strategy buttons)");
 }
 
 - (void)updateDiagButtonTitles {
-    if (self.diagButtons.count < 6) { return; }
+    if (self.diagButtons.count < 12) { return; }
+    UIColor *onColor = [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0];
+    // [v11] 修正 v9/v10 标签错位：按钮序号必须与 titles 数组一致。
+    // [0..2] 源模式（互斥单选）
     NSArray *srcNames = @[@"源HOOK", @"源快照", @"源渲染"];
-    NSArray *tbNames = @[@"时基齐", @"时基绝"];
     for (NSUInteger i = 0; i < 3; i++) {
         BOOL on = (self.pipSourceMode == (int)i);
-        [(UIButton *)self.diagButtons[i] setTitle:(on ? [@"*" stringByAppendingString:srcNames[i]] : srcNames[i])
-                                        forState:UIControlStateNormal];
-        [(UIButton *)self.diagButtons[i] setTitleColor:(on ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
-                                                          : [UIColor whiteColor])
-                                            forState:UIControlStateNormal];
+        UIButton *b = self.diagButtons[i];
+        [b setTitle:(on ? [@"*" stringByAppendingString:srcNames[i]] : srcNames[i])
+            forState:UIControlStateNormal];
+        [b setTitleColor:(on ? onColor : [UIColor whiteColor]) forState:UIControlStateNormal];
     }
-    for (NSUInteger i = 0; i < 2; i++) {
-        BOOL on = (self.pipTimebaseMode == (int)i);
-        [(UIButton *)self.diagButtons[3 + i] setTitle:(on ? [@"*" stringByAppendingString:tbNames[i]] : tbNames[i])
-                                             forState:UIControlStateNormal];
-        [(UIButton *)self.diagButtons[3 + i] setTitleColor:(on ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
-                                                               : [UIColor whiteColor])
-                                                 forState:UIControlStateNormal];
+    // [3] 提亮（开关）
+    {
+        BOOL on = self.pipBoost;
+        UIButton *b = self.diagButtons[3];
+        [b setTitle:(on ? @"*提亮" : @"提亮") forState:UIControlStateNormal];
+        [b setTitleColor:(on ? onColor : [UIColor whiteColor]) forState:UIControlStateNormal];
     }
-    BOOL boostOn = self.pipBoost;
-    [(UIButton *)self.diagButtons[5] setTitle:(boostOn ? @"*提亮" : @"提亮") forState:UIControlStateNormal];
-    [(UIButton *)self.diagButtons[5] setTitleColor:(boostOn ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
-                                                            : [UIColor whiteColor])
-                                        forState:UIControlStateNormal];
-    for (NSUInteger i = 0; i < 3; i++) {
-        NSString *t = (i == 0 ? @"时基齐" : (i == 1 ? @"时基绝" : @"时基无"));
-        BOOL on = (self.pipTimebaseMode == (int)i);
-        [(UIButton *)self.diagButtons[4 + i] setTitle:(on ? [@"*" stringByAppendingString:t] : t)
-                                             forState:UIControlStateNormal];
-        [(UIButton *)self.diagButtons[4 + i] setTitleColor:(on ? [UIColor colorWithRed:0.3 green:1.0 blue:0.4 alpha:1.0]
-                                                                 : [UIColor whiteColor])
-                                                 forState:UIControlStateNormal];
+    // [4..6] 时基（互斥单选）：4=时基绝(mode1) 5=时基齐(mode0) 6=时基无(mode3)
+    {
+        int tbModes[3] = {1, 0, 3};
+        NSArray *tbNames = @[@"时基绝", @"时基齐", @"时基无"];
+        for (NSUInteger i = 0; i < 3; i++) {
+            BOOL on = (self.pipTimebaseMode == tbModes[i]);
+            UIButton *b = self.diagButtons[4 + i];
+            [b setTitle:(on ? [@"*" stringByAppendingString:tbNames[i]] : tbNames[i])
+                forState:UIControlStateNormal];
+            [b setTitleColor:(on ? onColor : [UIColor whiteColor]) forState:UIControlStateNormal];
+        }
+    }
+    // [9..11] 色度（互斥单选）：9=直(0) 10=灰(1) 11=B(2)
+    {
+        NSArray *chromaNames = @[@"色度直", @"色度灰", @"色度B"];
+        for (NSUInteger i = 0; i < 3; i++) {
+            BOOL on = (self.pipChromaMode == (int)i);
+            UIButton *b = self.diagButtons[9 + i];
+            [b setTitle:(on ? [@"*" stringByAppendingString:chromaNames[i]] : chromaNames[i])
+                forState:UIControlStateNormal];
+            [b setTitleColor:(on ? onColor : [UIColor whiteColor]) forState:UIControlStateNormal];
+        }
     }
 }
 
@@ -1536,24 +1580,42 @@ API_AVAILABLE(ios(15.0))
         case 8:
             [self setMirrorHostFront:NO];
             break;
+        case 9:
+            self.pipChromaMode = 0;
+            PipEnablerDiagLog(@"v11: CHROMA=passthrough (copy source UV, green-screen fix)");
+            break;
+        case 10:
+            self.pipChromaMode = 1;
+            PipEnablerDiagLog(@"v11: CHROMA=grayscale (force U=V=128)");
+            break;
+        case 11:
+            self.pipChromaMode = 2;
+            PipEnablerDiagLog(@"v11: CHROMA=convert-to-BGRA (full-frame YUV->RGB)");
+            break;
         default:
             break;
     }
     [self updateDiagButtonTitles];
 }
 
-// [v9] 亮度增益：把 Y 平面（420v）或各通道（BGRA）乘以系数，用于验证
-// 「内容是对的、只是太暗」这种可能。
-- (CVPixelBufferRef)boostedCopyOfPixelBuffer:(CVPixelBufferRef)pb {
+// [v11] 统一处理管线：亮度增益(pipBoost) + 色度模式(pipChromaMode)。
+// 修复 v9/v10 绿屏根因：旧 boostedCopy 只拷贝 Y 平面，新建 buffer 的 UV 平面
+// 全零，YUV->RGB 时 U=V=0 输出纯绿（v10 用户反馈：绿屏但隐约可见画面）。
+// chroma: 0=直通(拷贝源 UV) 1=灰度(U=V=128) 2=整帧转 BGRA(绕过 YUV 平面问题)
+- (CVPixelBufferRef)processedCopyOfPixelBuffer:(CVPixelBufferRef)pb {
     if (pb == NULL) { return NULL; }
     size_t w = CVPixelBufferGetWidth(pb);
     size_t h = CVPixelBufferGetHeight(pb);
     if (w == 0 || h == 0) { return NULL; }
     OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+    BOOL toBGRA = (self.pipChromaMode == 2);
+    BOOL gray = (self.pipChromaMode == 1);
+    double gain = self.pipBoost ? 6.0 : 1.0;
     CVPixelBufferRef out = NULL;
     NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
-                             (__bridge CFDictionaryRef)attrs, &out) != kCVReturnSuccess) {
+    OSType outFmt = toBGRA ? kCVPixelFormatType_32BGRA : fmt;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, outFmt,
+                            (__bridge CFDictionaryRef)attrs, &out) != kCVReturnSuccess) {
         return NULL;
     }
     if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess ||
@@ -1561,23 +1623,81 @@ API_AVAILABLE(ios(15.0))
         CFRelease(out);
         return NULL;
     }
-    if (CVPixelBufferGetPlaneCount(pb) > 0 && CVPixelBufferGetPlaneCount(out) > 0) {
-        // 420v: 只放大 Y 平面
-        const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-        uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(out, 0);
-        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-        size_t ph = CVPixelBufferGetHeightOfPlane(pb, 0);
-        if (src != NULL && dst != NULL) {
-            for (size_t y = 0; y < ph; y++) {
-                const uint8_t *s = src + y * bpr;
-                uint8_t *d = dst + y * bpr;
-                for (size_t x = 0; x < bpr; x++) {
-                    int v = (int)s[x] * 6;
-                    d[x] = (uint8_t)(v > 255 ? 255 : v);
+    size_t srcPlanes = CVPixelBufferGetPlaneCount(pb);
+    if (toBGRA && srcPlanes >= 2) {
+        // [v11] YUV(420v/420f) -> BGRA 整帧转换（绕过一切 YUV 平面/格式问题）
+        const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(out);
+        size_t bprY = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        size_t bprUV = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        size_t dbpr = CVPixelBufferGetBytesPerRow(out);
+        BOOL videoRange = (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        if (srcY != NULL && srcUV != NULL && dst != NULL) {
+            for (size_t y = 0; y < h; y++) {
+                const uint8_t *yRow = srcY + y * bprY;
+                const uint8_t *uvRow = srcUV + (y / 2) * bprUV;
+                uint8_t *d = dst + y * dbpr;
+                for (size_t x = 0; x < w; x++) {
+                    double Y = (double)yRow[x];
+                    double U = gray ? 128.0 : (double)uvRow[(x / 2) * 2];
+                    double V = gray ? 128.0 : (double)uvRow[(x / 2) * 2 + 1];
+                    if (videoRange) {
+                        Y = (Y - 16.0) * (255.0 / 219.0);
+                        U = (U - 128.0) * (255.0 / 224.0) + 128.0;
+                        V = (V - 128.0) * (255.0 / 224.0) + 128.0;
+                    }
+                    Y *= gain;
+                    double R = Y + 1.402 * (V - 128.0);
+                    double G = Y - 0.344 * (U - 128.0) - 0.714 * (V - 128.0);
+                    double B = Y + 1.772 * (U - 128.0);
+                    d[x * 4 + 0] = (uint8_t)(B < 0 ? 0 : (B > 255 ? 255 : B));
+                    d[x * 4 + 1] = (uint8_t)(G < 0 ? 0 : (G > 255 ? 255 : G));
+                    d[x * 4 + 2] = (uint8_t)(R < 0 ? 0 : (R > 255 ? 255 : R));
+                    d[x * 4 + 3] = 255;
+                }
+            }
+        }
+    } else if (srcPlanes >= 2 && CVPixelBufferGetPlaneCount(out) >= 2) {
+        // [v11] 双平面 YUV：拷贝 Y（可选增益）+ 拷贝 UV（或填 128 灰度）——绿屏修复点
+        const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(out, 0);
+        size_t bprY = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        size_t dbprY = CVPixelBufferGetBytesPerRowOfPlane(out, 0);
+        size_t phY = CVPixelBufferGetHeightOfPlane(pb, 0);
+        if (srcY != NULL && dstY != NULL) {
+            size_t copyW = (bprY < dbprY) ? bprY : dbprY;
+            for (size_t y = 0; y < phY; y++) {
+                const uint8_t *s = srcY + y * bprY;
+                uint8_t *d = dstY + y * dbprY;
+                if (gain == 1.0) {
+                    memcpy(d, s, copyW);
+                } else {
+                    for (size_t x = 0; x < copyW; x++) {
+                        int v = (int)(s[x] * gain);
+                        d[x] = (uint8_t)(v > 255 ? 255 : v);
+                    }
+                }
+            }
+        }
+        const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(out, 1);
+        size_t bprUV = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        size_t dbprUV = CVPixelBufferGetBytesPerRowOfPlane(out, 1);
+        size_t phUV = CVPixelBufferGetHeightOfPlane(pb, 1);
+        if (dstUV != NULL) {
+            size_t copyUV = (bprUV < dbprUV) ? bprUV : dbprUV;
+            for (size_t y = 0; y < phUV; y++) {
+                uint8_t *d = dstUV + y * dbprUV;
+                if (gray || srcUV == NULL) {
+                    memset(d, 128, copyUV);
+                } else {
+                    memcpy(d, srcUV + y * bprUV, copyUV);
                 }
             }
         }
     } else {
+        // 单平面（BGRA 源等）：整帧处理（屏幕源本身有真实色彩）
         const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
         uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(out);
         size_t bpr = CVPixelBufferGetBytesPerRow(pb);
@@ -1585,9 +1705,13 @@ API_AVAILABLE(ios(15.0))
             for (size_t y = 0; y < h; y++) {
                 const uint8_t *s = src + y * bpr;
                 uint8_t *d = dst + y * bpr;
-                for (size_t x = 0; x < bpr; x++) {
-                    int v = (int)s[x] * 6;
-                    d[x] = (uint8_t)(v > 255 ? 255 : v);
+                if (gain == 1.0 && !gray) {
+                    memcpy(d, s, bpr);
+                } else {
+                    for (size_t x = 0; x < bpr; x++) {
+                        int v = (int)(s[x] * gain);
+                        d[x] = (uint8_t)(v > 255 ? 255 : v);
+                    }
                 }
             }
         }
@@ -1753,6 +1877,11 @@ API_AVAILABLE(ios(15.0))
     if (PipEnablerLumaStats(pixelBuffer, &mn, &mx, &avg)) {
         self.hookLuma = avg / 255.0;
         self.diagLastLuma = self.hookLuma;
+        // [v11] 色度统计：判断源帧 UV 是否真实（uvAvg≈0 → 源色度为零）
+        double uvAvg = 0;
+        if (PipEnablerChromaStats(pixelBuffer, &uvAvg)) {
+            self.lastUVAvg = uvAvg;
+        }
         PipFeedSourceStat *st = PipEnablerFeedSourceStat(gPipFeedSourceTag);
         if (mx < 24.0) {
             if (st != NULL) {
@@ -1774,8 +1903,8 @@ API_AVAILABLE(ios(15.0))
         if (self.diagLumaSamples < 8) {
             self.diagLumaSamples += 1;
             OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
-            PipEnablerDiagLog(@"v8: hook GOOD frame src=%s minY=%.0f maxY=%.0f avgY=%.0f size=%zux%zu fmt=%c%c%c%c",
-                              gPipFeedSourceTag, mn, mx, avg,
+            PipEnablerDiagLog(@"v11: hook GOOD frame src=%s minY=%.0f maxY=%.0f avgY=%.0f uvAvg=%.1f size=%zux%zu fmt=%c%c%c%c",
+                              gPipFeedSourceTag, mn, mx, avg, self.lastUVAvg,
                               CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
                               (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
                               (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF));
