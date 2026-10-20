@@ -188,8 +188,8 @@ static CVPixelBufferRef gTestPixelBuffer = NULL;
         R(@"PipEnablerFeedPixelBuffer(pb) x5 已调用");
     }
 
-    // 给管线 2 秒把帧入队、让 controlTimebase 推进。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+    // 给管线 2 秒把帧入队、让 controlTimebase 推进。[v12] 再留 1.5s 让 2s 重试定时器至少跑一轮。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self readStateAndFinish];
     });
@@ -221,6 +221,20 @@ static CVPixelBufferRef gTestPixelBuffer = NULL;
     } @catch (NSException *e) {
         R(@"KVC 读取内部属性异常: %@", e);
     }
+
+    // [v12] 启动重试路径断言：2s 定时器应至少跑过一轮 refreshDetection 重试检查。
+    NSUInteger retryChecks = 0;
+    @try {
+        if (mgr) {
+            id rc = [mgr valueForKey:@"pipRetryChecks"];
+            if ([rc respondsToSelector:@selector(unsignedLongValue)]) {
+                retryChecks = [rc unsignedLongValue];
+            }
+        }
+    } @catch (NSException *e) {
+        R(@"KVC 读取 pipRetryChecks 异常: %@", e);
+    }
+    R(@"v12 pipRetryChecks=%lu (2s 定时器 refreshDetection 重试检查次数)", (unsigned long)retryChecks);
 
     R(@"mirrorLayer=%p  mirrorHostView=%p  pipController=%p  playbackDelegate=%p",
       mirror, hostView, pipc, playbackDelegate);
@@ -267,11 +281,13 @@ static CVPixelBufferRef gTestPixelBuffer = NULL;
               && _copyHooked          // 证明构造函数真实执行且抓帧钩子装上了
               && _enqHooked           // 证明 enqueueSampleBuffer: swizzle 真实生效
               && (gTestPixelBuffer != NULL)
-              && mirrorOK;            // 喂帧后镜像层未进入 failed（未崩溃、链路跑通）
+              && mirrorOK             // 喂帧后镜像层未进入 failed（未崩溃、链路跑通）
+              && (retryChecks >= 1);  // [v12] 2s 定时器重试路径真实执行
     R(@"");
-    R(@"SUMMARY: dlopen=%d manager=%d hook(copyPixelBuffer)=%d hook(enqueue)=%d mirrorOK=%d pipSupported=%d pipPossible=%d",
+    R(@"SUMMARY: dlopen=%d manager=%d hook(copyPixelBuffer)=%d hook(enqueue)=%d mirrorOK=%d pipSupported=%d pipPossible=%d retryChecks=%lu",
       _dylibHandle != NULL, _mgrClass != Nil, (int)_copyHooked, (int)_enqHooked,
-      (int)mirrorOK, (int)[AVPictureInPictureController isPictureInPictureSupported], (int)pipPossible);
+      (int)mirrorOK, (int)[AVPictureInPictureController isPictureInPictureSupported], (int)pipPossible,
+      (unsigned long)retryChecks);
     R(@"SELFTEST_RESULT: %@", pass ? @"PASS" : @"FAIL");
 
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];

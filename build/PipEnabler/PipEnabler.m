@@ -693,6 +693,10 @@ API_AVAILABLE(ios(15.0))
 @property (nonatomic, assign) BOOL        pipBoost;
 @property (nonatomic, assign) int         pipChromaMode;  // [v11] 0=直通(拷源UV) 1=灰度(U=V=128) 2=转BGRA
 @property (nonatomic, assign) double      lastUVAvg;      // [v11] 源帧 UV 平面平均值
+@property (nonatomic, assign) NSUInteger pipStartAttempts; // [v12] startPictureInPicture 重试次数
+@property (nonatomic, assign) NSUInteger pipRetryChecks;   // [v12] 重试检查次数（模拟器自测断言用）
+@property (nonatomic, assign) BOOL        pipPeakPossible; // [v12] possible 是否到过 YES
+@property (nonatomic, strong) UIButton   *playerPiPButton; // [v12] 播放器控制栏内 PiP 图标
 @property (nonatomic, strong) NSMutableArray<UIButton *> *diagButtons;
 @property (nonatomic, strong) UIView *diagPanel;
 @property (nonatomic, assign) void      *renderServerSurface;
@@ -722,10 +726,12 @@ API_AVAILABLE(ios(15.0))
 - (void)installDiagButtons;
 - (void)updateDiagButtonTitles;
 - (void)diagButtonTapped:(UIButton *)sender;
-- (void)setMirrorHostFront:(BOOL)front;
 - (void)logMirrorHostState;
 - (CVPixelBufferRef)renderServerFrameForView:(UIView *)view;
 - (CVPixelBufferRef)processedCopyOfPixelBuffer:(CVPixelBufferRef)pb;
+- (void)installPlayerPiPButton;     // [v12] 播放器控制栏注入 PiP 图标
+- (void)attachMirrorHostToWindow;   // [v12] 宿主挂载 A/B
+- (void)detachMirrorHostFromWindow; // [v12] 宿主卸载 A/B
 - (NSString *)recentDiagText;
 - (void)showDiagnosticsAlert;
 
@@ -884,7 +890,10 @@ API_AVAILABLE(ios(15.0))
         PipEnablerDiagLog(@"floating button installed on window=%@", NSStringFromClass(win.class));
         // [v9] 诊断按钮组（每种策略一个）
         [self installDiagButtons];
-        self.diagPanel.frame = CGRectMake(win.bounds.size.width - 78, 96, 74, 236);
+        // [v12] 面板 2 倍大、屏幕居中（调试期）
+        CGFloat pipPw = 292.0, pipPh = 352.0;
+        self.diagPanel.frame = CGRectMake((win.bounds.size.width - pipPw) / 2.0,
+                                         (win.bounds.size.height - pipPh) / 2.0, pipPw, pipPh);
     };
 
     if (NSThread.isMainThread) {
@@ -969,9 +978,19 @@ API_AVAILABLE(ios(15.0))
             self.detectedPlayerLayer = pl;
             [self attachToPlayerLayer:pl];
         }
-        // [P4] The mirror pipeline is the PiP content source now, so it must ALWAYS run.
-        // It used to be an else-branch, so any detected AVPlayerLayer blocked it.
+        // [P4] 始终走镜像管线（不再 if/else 互斥）
         [self prepareMirrorPipeline];
+        // [v12] 启动自愈：KVO/首帧触发点可能错过或被系统拒绝，这里每轮补一次。
+        // v11 实测：enable 时图层冷启动 possible=0，start 失败后无人重试 → PiP 永远不起。
+        self.pipRetryChecks += 1;
+        if (self.pipController != nil && !self.pipActive &&
+            self.pipController.isPictureInPicturePossible) {
+            self.pipPeakPossible = YES;
+            self.pipStartAttempts += 1;
+            PipEnablerDiagLog(@"v12: retry startPictureInPicture (check=%lu attempt=%lu)",
+                              (unsigned long)self.pipRetryChecks, (unsigned long)self.pipStartAttempts);
+            [self.pipController startPictureInPicture];
+        }
     });
 }
 
@@ -1123,6 +1142,7 @@ API_AVAILABLE(ios(15.0))
                           (int)possible,
                           (int)((self.pipController != nil) && self.pipController.isPictureInPictureActive),
                           (int)self.enabled, self.pipController ? @"yes" : @"no");
+        if (possible) { self.pipPeakPossible = YES; }   // [v12] 记录 possible 峰值
         if (self.enabled && self.pipController != nil &&
             self.pipController.isPictureInPicturePossible &&
             !self.pipController.isPictureInPictureActive) {
@@ -1240,9 +1260,10 @@ API_AVAILABLE(ios(15.0))
         (unsigned long)self.diagFedFrames, (unsigned long)self.diagEnqueuedFrames];
     [s appendFormat:@"hookLuma=%.4f snapshotLuma=%.4f\n",
         self.hookLuma, self.snapshotLuma];
-    [s appendFormat:@"mode: source=%d timebase=%d boost=%d chroma=%d uvAvg=%.1f\n",
+    [s appendFormat:@"mode: source=%d timebase=%d boost=%d chroma=%d uvAvg=%.1f peakPossible=%d startAttempts=%lu\n",
         self.pipSourceMode, self.pipTimebaseMode, (int)self.pipBoost,
-        self.pipChromaMode, self.lastUVAvg];
+        self.pipChromaMode, self.lastUVAvg, (int)self.pipPeakPossible,
+        (unsigned long)self.pipStartAttempts];
     [s appendString:@"--- capture sources ---\n"];
     [s appendString:PipEnablerFeedSourceSummary()];
     return s;
@@ -1471,21 +1492,21 @@ API_AVAILABLE(ios(15.0))
     if (win == nil) { return; }
     PipEnablerLoadPrivateSymbols();
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 74, 368)];
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 292, 352)];
     panel.backgroundColor = [UIColor clearColor];
     panel.userInteractionEnabled = YES;
 
     NSArray *titles = @[@"源HOOK", @"源快照", @"源渲染", @"提亮",
-                      @"时基绝", @"时基齐", @"时基无", @"镜像前", @"镜像后",
+                      @"时基绝", @"时基齐", @"时基无", @"宿主挂", @"宿主卸",
                       @"色度直", @"色度灰", @"色度B"];
     self.diagButtons = [NSMutableArray array];
     for (NSUInteger i = 0; i < titles.count; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(2, 2 + (CGFloat)i * 30, 70, 27);
+        b.frame = CGRectMake(4 + (CGFloat)(i % 2) * 144.0, 4 + (CGFloat)(i / 2) * 58.0, 140, 54);
         b.titleLabel.adjustsFontSizeToFitWidth = YES;
         b.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.85];
         b.layer.cornerRadius = 5.0;
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:20.0];
         [b setTitle:titles[i] forState:UIControlStateNormal];
         [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         b.tag = (NSInteger)i;
@@ -1496,7 +1517,7 @@ API_AVAILABLE(ios(15.0))
     [win addSubview:panel];
     self.diagPanel = panel;
     [self updateDiagButtonTitles];
-    PipEnablerDiagLog(@"v11: diagnostic panel installed (12 strategy buttons)");
+    PipEnablerDiagLog(@"v12: diagnostic panel installed (12 big buttons, 2x, 2-col grid)");
 }
 
 - (void)updateDiagButtonTitles {
@@ -1530,6 +1551,16 @@ API_AVAILABLE(ios(15.0))
                 forState:UIControlStateNormal];
             [b setTitleColor:(on ? onColor : [UIColor whiteColor]) forState:UIControlStateNormal];
         }
+    }
+    // [7..8] 宿主挂载状态（v12：原镜像层级按钮改为真正的挂载/卸载 A/B）
+    {
+        BOOL attached = (self.mirrorHostView != nil && self.mirrorHostView.window != nil);
+        UIButton *b7 = self.diagButtons[7];
+        [b7 setTitle:(attached ? @"*宿主挂" : @"宿主挂") forState:UIControlStateNormal];
+        [b7 setTitleColor:(attached ? onColor : [UIColor whiteColor]) forState:UIControlStateNormal];
+        UIButton *b8 = self.diagButtons[8];
+        [b8 setTitle:(attached ? @"宿主卸" : @"*宿主卸") forState:UIControlStateNormal];
+        [b8 setTitleColor:(attached ? [UIColor whiteColor] : onColor) forState:UIControlStateNormal];
     }
     // [9..11] 色度（互斥单选）：9=直(0) 10=灰(1) 11=B(2)
     {
@@ -1575,10 +1606,10 @@ API_AVAILABLE(ios(15.0))
             PipEnablerDiagLog(@"v10: TIMEBASE=none (no controlTimebase, rely on DisplayImmediately)");
             break;
         case 7:
-            [self setMirrorHostFront:YES];
+            [self attachMirrorHostToWindow];
             break;
         case 8:
-            [self setMirrorHostFront:NO];
+            [self detachMirrorHostFromWindow];
             break;
         case 9:
             self.pipChromaMode = 0;
@@ -1783,21 +1814,37 @@ API_AVAILABLE(ios(15.0))
     return out;
 }
 
-// [v10] Move the mirror host view in the z-order so the user can A/B the
-// "layer must be really visible" hypothesis without rebuilding.
-- (void)setMirrorHostFront:(BOOL)front {
-    UIView *host = self.mirrorHostView;
-    if (host == nil || host.window == nil) {
-        PipEnablerDiagLog(@"v10: mirror host not attached yet");
-        return;
-    }
-    UIWindow *win = host.window;
-    if (front) {
-        [win bringSubviewToFront:host];
-    } else {
-        [win insertSubview:host atIndex:0];
-    }
-    [self logMirrorHostState];
+// [v12] 宿主挂载/卸载 A/B：修复 v10 引入的 bug——把 insertSubview:atIndex:0（会添加视图）
+// 改成 bringSubviewToFront:（对非子视图是空操作），导致 v10/v11 宿主从未真正进窗口。
+// 但 v10 实测「未挂载」反而是唯一出过内容的配置，故默认保持不挂载，用这两个按钮现场 A/B。
+- (void)attachMirrorHostToWindow {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *host = self.mirrorHostView;
+        if (host == nil) { PipEnablerDiagLog(@"v12: attach host: no host yet"); return; }
+        UIWindow *win = [self activeKeyWindowForButton];
+        if (win == nil) { PipEnablerDiagLog(@"v12: attach host: no keyWindow"); return; }
+        if (host.window == win) {
+            [win bringSubviewToFront:host];
+            PipEnablerDiagLog(@"v12: host already attached, brought to front");
+        } else {
+            [win addSubview:host];
+            [win bringSubviewToFront:host];
+            PipEnablerDiagLog(@"v12: host ATTACHED to window (visible preview config)");
+        }
+        [self logMirrorHostState];
+    });
+}
+
+- (void)detachMirrorHostFromWindow {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *host = self.mirrorHostView;
+        if (host == nil || host.superview == nil) {
+            PipEnablerDiagLog(@"v12: detach host: not attached (v10 winning config)");
+            return;
+        }
+        [host removeFromSuperview];
+        PipEnablerDiagLog(@"v12: host DETACHED from window");
+    });
 }
 
 - (void)logMirrorHostState {
@@ -1816,6 +1863,66 @@ API_AVAILABLE(ios(15.0))
                       layer.superlayer ? @"yes" : @"no",
                       NSStringFromCGRect(layer.frame),
                       NSStringFromCGRect(layer.bounds));
+}
+
+// [v12] ---- 播放器控制栏内 PiP 图标 ----------------------------------------
+// 用户要求的 UX：播放视频时控制栏出现画中画图标，点按对当前视频开/关 PiP。
+// 控制栏类名来自静态逆向（BU_ZFPlayerControlView / ZFPlayerControlView）。
+- (void)installPlayerPiPButton {
+    if (self.playerPiPButton != nil && self.playerPiPButton.superview != nil) {
+        return;  // 已在位
+    }
+    UIView *ctrl = [self findPlayerControlView];
+    if (ctrl == nil) { return; }
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    UIImage *img = [UIImage systemImageNamed:@"pip.fill"];
+    if (img == nil) { img = [UIImage systemImageNamed:@"rectangle.on.rectangle"]; }
+    if (img != nil) {
+        [b setImage:img forState:UIControlStateNormal];
+        b.tintColor = [UIColor whiteColor];
+    } else {
+        [b setTitle:@"PiP" forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    }
+    b.frame = CGRectMake(ctrl.bounds.size.width - 56.0, ctrl.bounds.size.height - 132.0, 44.0, 44.0);
+    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
+    b.layer.cornerRadius = 8.0;
+    b.accessibilityIdentifier = @"PipEnablerPlayerButton";
+    [b addTarget:self action:@selector(playerPiPButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [ctrl addSubview:b];
+    self.playerPiPButton = b;
+    PipEnablerDiagLog(@"v12: player PiP button injected into %@ (ctrl=%@ btn=%@)",
+                      NSStringFromClass(ctrl.class),
+                      NSStringFromCGRect(ctrl.bounds), NSStringFromCGRect(b.frame));
+}
+
+- (UIView *)findPlayerControlView {
+    UIWindow *win = [self activeKeyWindowForButton];
+    if (win == nil) { return nil; }
+    return [self pipFindSubview:win matchingNames:@[@"ZFPlayerControlView", @"PlayerControlView"] minSize:200.0];
+}
+
+- (UIView *)pipFindSubview:(UIView *)root matchingNames:(NSArray<NSString *> *)names minSize:(CGFloat)minSize {
+    if (root == nil) { return nil; }
+    NSString *cls = NSStringFromClass(root.class);
+    for (NSString *n in names) {
+        if ([cls containsString:n] &&
+            root.bounds.size.width >= minSize && root.bounds.size.height >= minSize * 0.4) {
+            return root;
+        }
+    }
+    for (UIView *sub in root.subviews) {
+        UIView *hit = [self pipFindSubview:sub matchingNames:names minSize:minSize];
+        if (hit != nil) { return hit; }
+    }
+    return nil;
+}
+
+- (void)playerPiPButtonTapped:(UIButton *)sender {
+    PipEnablerDiagLog(@"v12: player PiP button tapped -> toggle");
+    [self toggle];
 }
 
 #pragma mark - PiP 启停
@@ -2617,6 +2724,7 @@ static void PipEnablerInitialize(void) {
 
             // 周期性重试探测（应对延迟创建播放器/图层的情况）
             NSTimer *timer = [NSTimer timerWithTimeInterval:2.0 repeats:YES block:^(NSTimer * _Nonnull t) {
+                [manager installPlayerPiPButton];   // [v12] 播放器控制栏 PiP 图标（常驻重注入）
                 if ([manager isEnabled]) {
                     [manager refreshDetection];
                 }
