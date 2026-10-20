@@ -1080,10 +1080,12 @@ API_AVAILABLE(ios(15.0))
                 }
                 [host.layer addSublayer:self.mirrorLayer];
                 self.mirrorHostView = host;
-                // [v13] 真正挂载：v10 把 insertSubview:atIndex:0 误改成 bringSubviewToFront:
-                // （对非子视图是空操作），宿主从未进过窗口。现在统一走 attachMirrorHostToWindow
-                // （addSubview + bringSubviewToFront）。挂载/卸载 A/B 由自测脚本自动完成。
-                [self attachMirrorHostToWindow];
+                // [v13.1] 默认不挂载（保持 v10/v11/v12 行为）：
+                //  - v13 曾在 prepare 里 addSubview，iOS 模拟器主线程随即挂死
+                //    （2s 定时器/3.5s 判定全部未执行，无崩溃报告），CI 稳定复现；
+                //  - v10 真机证据：不挂载是唯一显示过内容的配置；
+                //  - 挂载/卸载 A/B 由自测脚本按「先安全后冒险」顺序自动完成。
+                //    （宿主不在窗口里时 AVSampleBufferDisplayLayer 仍可被 PiP 内容源直接渲染）
                 [self logMirrorHostState];
                 PIP_LOG(@"mirror host view attached to keyWindow");
             PipEnablerDiagLog(@"mirror host view attached to keyWindow, hidden=%d alpha=%.2f frame=%@",
@@ -2066,7 +2068,7 @@ API_AVAILABLE(ios(15.0))
                    dispatch_get_main_queue(), ^{
         PipEnablerManager *s = weakSelf;
         if (s == nil) { return; }
-        PipEnablerDiagLog(@"[SELFTEST] stepA1 (+1.2s): setEnabled(YES)，宿主=挂载模式");
+        PipEnablerDiagLog(@"[SELFTEST] stepA1 (+1.2s): setEnabled(YES)，宿主=默认不挂载（v10 获胜配置）");
         [s setEnabled:YES];
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.5 * NSEC_PER_SEC)),
@@ -2080,13 +2082,13 @@ API_AVAILABLE(ios(15.0))
                           (int)startedA, (unsigned long)s.pipDidStartCount,
                           (unsigned long)s.pipFailedStartCount);
         if (!startedA) {
-            PipEnablerDiagLog(@"[SELFTEST] stepB0: 切换宿主=卸载模式（v10 唯一出过内容的配置）");
-            [s detachMirrorHostFromWindow];
+            PipEnablerDiagLog(@"[SELFTEST] stepB0: 切换宿主=挂载模式（v13 模拟器曾在此挂死，真机谨慎）");
+            [s attachMirrorHostToWindow];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 PipEnablerManager *s2 = weakSelf;
                 if (s2 == nil) { return; }
-                PipEnablerDiagLog(@"[SELFTEST] stepB2 卸载模式状态:\n%@", [s2 stateSummary]);
+                PipEnablerDiagLog(@"[SELFTEST] stepB2 挂载模式状态:\n%@", [s2 stateSummary]);
                 BOOL startedB = (s2.pipDidStartCount > 0) ||
                                 (s2.pipController != nil && s2.pipController.isPictureInPictureActive);
                 PipEnablerDiagLog(@"[SELFTEST] stepB 结论: PiP已启动=%d", (int)startedB);
